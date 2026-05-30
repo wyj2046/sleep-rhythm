@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>睡眠起床时间记录</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Rhythm Log</p>
+          <h1>睡眠起床时间记录</h1>
+        </div>
+        <div class="topbar-actions">
+          <button class="icon-button" id="exportCsvBtn" type="button" title="导出 CSV" aria-label="导出 CSV">
+            <i data-lucide="file-spreadsheet"></i>
+          </button>
+          <button class="icon-button" id="exportJsonBtn" type="button" title="导出 JSON" aria-label="导出 JSON">
+            <i data-lucide="download"></i>
+          </button>
+          <label class="icon-button file-button" title="导入 JSON" aria-label="导入 JSON">
+            <i data-lucide="upload"></i>
+            <input id="importJsonInput" type="file" accept="application/json" />
+          </label>
+        </div>
+      </header>
+
+      <main class="layout">
+        <aside class="side-panel">
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>记录</h2>
+              <button class="text-button ghost" id="resetFormBtn" type="button">新建</button>
+            </div>
+            <form id="entryForm" class="entry-form">
+              <input id="editingId" type="hidden" />
+              <label>
+                <span>睡眠日</span>
+                <input id="sleepDate" name="sleepDate" type="date" required />
+              </label>
+              <div class="field-grid">
+                <label>
+                  <span>入睡</span>
+                  <input id="bedTime" name="bedTime" type="time" required />
+                </label>
+                <label>
+                  <span>起床</span>
+                  <input id="wakeTime" name="wakeTime" type="time" required />
+                </label>
+              </div>
+              <fieldset class="tag-fieldset">
+                <legend>影响因素</legend>
+                <div class="tag-grid" id="tagGrid"></div>
+              </fieldset>
+              <label>
+                <span>备注</span>
+                <textarea id="note" name="note" rows="4" placeholder="那天发生了什么"></textarea>
+              </label>
+              <button class="primary-button" type="submit">
+                <i data-lucide="save"></i>
+                保存记录
+              </button>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>目标</h2>
+            </div>
+            <form id="settingsForm" class="settings-form">
+              <div class="field-grid">
+                <label>
+                  <span>目标入睡</span>
+                  <input id="targetBed" name="targetBed" type="time" />
+                </label>
+                <label>
+                  <span>目标起床</span>
+                  <input id="targetWake" name="targetWake" type="time" />
+                </label>
+              </div>
+              <label>
+                <span>偏离阈值 <b id="driftValue"></b></span>
+                <input id="driftThreshold" name="driftThreshold" type="range" min="15" max="120" step="15" />
+              </label>
+            </form>
+          </section>
+        </aside>
+
+        <section class="workspace">
+          <div class="stats-grid" id="statsGrid"></div>
+
+          <section class="chart-panel">
+            <div class="panel-heading chart-heading">
+              <div>
+                <h2>趋势</h2>
+                <p id="rangeLabel" class="muted"></p>
+              </div>
+              <div class="legend">
+                <span><b class="dot sleep-dot"></b>入睡</span>
+                <span><b class="dot wake-dot"></b>起床</span>
+                <span><b class="dot alert-dot"></b>波动</span>
+              </div>
+            </div>
+            <div class="chart-wrap">
+              <svg id="trendChart" role="img" aria-label="睡眠和起床时间趋势图"></svg>
+              <div id="chartTooltip" class="chart-tooltip" hidden></div>
+            </div>
+          </section>
+
+          <section class="content-grid">
+            <div class="panel">
+              <div class="panel-heading">
+                <h2>波动</h2>
+              </div>
+              <div id="anomalyList" class="anomaly-list"></div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-heading">
+                <h2>记录簿</h2>
+                <button class="text-button danger" id="clearAllBtn" type="button">清空</button>
+              </div>
+              <div id="entryList" class="entry-list"></div>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
