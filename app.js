@@ -477,11 +477,6 @@
       syncState.firebase = { auth: authModule, firestore: firestoreModule };
       syncState.configured = true;
 
-      authModule.getRedirectResult(syncState.auth).catch((error) => {
-        console.error(error);
-        setCloudUi("error", authErrorMessage(error));
-      });
-
       authModule.onAuthStateChanged(syncState.auth, async (user) => {
         syncState.user = user;
         syncState.ready = Boolean(user);
@@ -499,9 +494,9 @@
 
   async function signInWithGoogle() {
     if (!syncState.configured) return;
-    setCloudUi("checking", "正在前往 Google 登录...");
+    setCloudUi("checking", "正在打开 Google 登录...");
     try {
-      await syncState.firebase.auth.signInWithRedirect(syncState.auth, syncState.provider);
+      await syncState.firebase.auth.signInWithPopup(syncState.auth, syncState.provider);
     } catch (error) {
       console.error(error);
       setCloudUi("error", authErrorMessage(error));
@@ -628,6 +623,12 @@
 
   function authErrorMessage(error) {
     const code = error && error.code ? `（${error.code}）` : "";
+    if (error && error.code === "auth/popup-blocked") {
+      return "登录弹窗被浏览器拦截，请允许弹窗后重试。";
+    }
+    if (error && error.code === "auth/popup-closed-by-user") {
+      return "登录窗口已关闭，请重新点击 Google 登录。";
+    }
     return `登录失败${code}。请确认 Firebase 已启用 Google 登录，并添加 GitHub Pages 授权域名。`;
   }
 
