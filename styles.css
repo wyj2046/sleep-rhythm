@@ -269,6 +269,7 @@ textarea:focus {
 }
 
 .text-button {
+  gap: 7px;
   min-height: 34px;
   padding: 0 10px;
   background: #ece7df;
@@ -302,10 +303,53 @@ textarea:focus {
 
 .icon-button svg,
 .primary-button svg,
+.text-button svg,
 .entry-actions svg {
   width: 18px;
   height: 18px;
   stroke-width: 2.2;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: #ece7df;
+  color: #5f574f;
+  font-size: 0.76rem;
+  font-weight: 900;
+}
+
+.status-badge[data-status="synced"] {
+  background: var(--surface-2);
+  color: #2c6d52;
+}
+
+.status-badge[data-status="checking"] {
+  background: #eef3ff;
+  color: #3a5f99;
+}
+
+.status-badge[data-status="error"] {
+  background: #fff0ef;
+  color: #b43c3e;
+}
+
+.sync-status {
+  min-height: 42px;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.sync-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .stats-grid {

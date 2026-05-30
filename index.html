@@ -88,6 +88,25 @@
               </label>
             </form>
           </section>
+
+          <section class="panel">
+            <div class="panel-heading">
+              <h2>云同步</h2>
+              <span class="status-badge" id="cloudBadge">本地</span>
+            </div>
+            <p class="sync-status" id="cloudStatus">正在检查云同步配置...</p>
+            <div class="sync-actions">
+              <button class="text-button" id="signInBtn" type="button" hidden>
+                <i data-lucide="log-in"></i>
+                Google 登录
+              </button>
+              <button class="text-button" id="syncNowBtn" type="button" hidden>
+                <i data-lucide="refresh-cw"></i>
+                同步
+              </button>
+              <button class="text-button ghost" id="signOutBtn" type="button" hidden>退出</button>
+            </div>
+          </section>
         </aside>
 
         <section class="workspace">

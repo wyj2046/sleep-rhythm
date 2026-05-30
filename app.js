@@ -1,6 +1,7 @@
 (function () {
   const STORAGE_KEY = "sleep-rhythm.entries.v1";
   const SETTINGS_KEY = "sleep-rhythm.settings.v1";
+  const FIREBASE_SDK_VERSION = "12.13.0";
   const tags = ["工作", "娱乐", "运动", "社交", "补觉", "折腾"];
   const legacyDefaultSettings = {
     targetBed: "23:30",
@@ -15,6 +16,17 @@
   const state = {
     entries: loadEntries(),
     settings: loadSettings(),
+  };
+  const syncState = {
+    configured: false,
+    ready: false,
+    loading: false,
+    user: null,
+    auth: null,
+    db: null,
+    provider: null,
+    firebase: null,
+    pendingTimer: 0,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -42,6 +54,11 @@
     exportCsvBtn: $("#exportCsvBtn"),
     exportJsonBtn: $("#exportJsonBtn"),
     importJsonInput: $("#importJsonInput"),
+    cloudBadge: $("#cloudBadge"),
+    cloudStatus: $("#cloudStatus"),
+    signInBtn: $("#signInBtn"),
+    signOutBtn: $("#signOutBtn"),
+    syncNowBtn: $("#syncNowBtn"),
   };
 
   init();
@@ -51,6 +68,7 @@
     hydrateForms();
     bindEvents();
     render();
+    initCloudSync();
     if (window.lucide) {
       window.lucide.createIcons();
     } else {
@@ -66,6 +84,9 @@
     els.exportCsvBtn.addEventListener("click", exportCsv);
     els.exportJsonBtn.addEventListener("click", exportJson);
     els.importJsonInput.addEventListener("change", importJson);
+    els.signInBtn.addEventListener("click", signInWithGoogle);
+    els.signOutBtn.addEventListener("click", signOutCloud);
+    els.syncNowBtn.addEventListener("click", syncCloudFromLocal);
     window.addEventListener("resize", debounce(renderChart, 120));
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
@@ -134,7 +155,7 @@
       driftThreshold: Number(els.driftThreshold.value) || defaultSettings.driftThreshold,
     };
     els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+    persistSettings();
     render();
   }
 
@@ -433,6 +454,183 @@
     render();
   }
 
+  async function initCloudSync() {
+    setCloudUi("checking", "正在检查云同步配置...");
+    try {
+      const configModule = await import("./firebase-config.js");
+      const config = configModule.firebaseConfig;
+      if (!config || !config.apiKey || !config.projectId || !config.appId) {
+        setCloudUi("local", "未配置 Firebase，当前使用本地保存。");
+        return;
+      }
+
+      const [{ initializeApp }, authModule, firestoreModule] = await Promise.all([
+        import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-app.js`),
+        import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-auth.js`),
+        import(`https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-firestore.js`),
+      ]);
+
+      const app = initializeApp(config);
+      syncState.auth = authModule.getAuth(app);
+      syncState.db = firestoreModule.getFirestore(app);
+      syncState.provider = new authModule.GoogleAuthProvider();
+      syncState.firebase = { auth: authModule, firestore: firestoreModule };
+      syncState.configured = true;
+
+      authModule.getRedirectResult(syncState.auth).catch((error) => {
+        console.error(error);
+        setCloudUi("error", authErrorMessage(error));
+      });
+
+      authModule.onAuthStateChanged(syncState.auth, async (user) => {
+        syncState.user = user;
+        syncState.ready = Boolean(user);
+        renderCloudUi();
+        if (user) {
+          await loadCloudData();
+        }
+      });
+      renderCloudUi();
+    } catch (error) {
+      console.error(error);
+      setCloudUi("error", "云同步初始化失败，请检查 Firebase 配置。");
+    }
+  }
+
+  async function signInWithGoogle() {
+    if (!syncState.configured) return;
+    setCloudUi("checking", "正在前往 Google 登录...");
+    try {
+      await syncState.firebase.auth.signInWithRedirect(syncState.auth, syncState.provider);
+    } catch (error) {
+      console.error(error);
+      setCloudUi("error", authErrorMessage(error));
+    }
+  }
+
+  async function signOutCloud() {
+    if (!syncState.auth) return;
+    await syncState.firebase.auth.signOut(syncState.auth);
+    syncState.ready = false;
+    syncState.user = null;
+    renderCloudUi();
+  }
+
+  async function loadCloudData() {
+    if (!syncState.ready || syncState.loading) return;
+    syncState.loading = true;
+    setCloudUi("checking", "正在读取云端记录...");
+    try {
+      const { collection, doc, getDoc, getDocs } = syncState.firebase.firestore;
+      const settingsRef = doc(syncState.db, "users", syncState.user.uid, "profile", "settings");
+      const entriesRef = collection(syncState.db, "users", syncState.user.uid, "entries");
+      const [settingsSnapshot, entriesSnapshot] = await Promise.all([getDoc(settingsRef), getDocs(entriesRef)]);
+      const cloudSettings = settingsSnapshot.exists() ? settingsSnapshot.data() : null;
+      const cloudEntries = entriesSnapshot.docs.map((entryDoc) => ({ id: entryDoc.id, ...entryDoc.data() }));
+
+      if (cloudSettings) {
+        state.settings = sanitizeSettings(cloudSettings);
+      }
+      state.entries = mergeEntries(state.entries, cloudEntries);
+      sortEntries();
+      persistLocalOnly();
+      hydrateForms();
+      render();
+      syncState.loading = false;
+      await syncCloudFromLocal();
+      setCloudUi("synced", `已同步：${syncState.user.displayName || syncState.user.email || "Google 账号"}`);
+    } catch (error) {
+      console.error(error);
+      setCloudUi("error", "读取云端记录失败，请检查 Firestore 是否已开启并配置规则。");
+    } finally {
+      syncState.loading = false;
+    }
+  }
+
+  async function syncCloudFromLocal() {
+    if (!syncState.ready || !syncState.firebase || syncState.loading) return;
+    clearTimeout(syncState.pendingTimer);
+    setCloudUi("checking", "正在同步到云端...");
+    try {
+      const { collection, doc, getDocs, setDoc, writeBatch } = syncState.firebase.firestore;
+      const settingsRef = doc(syncState.db, "users", syncState.user.uid, "profile", "settings");
+      const entriesRef = collection(syncState.db, "users", syncState.user.uid, "entries");
+      const snapshot = await getDocs(entriesRef);
+      const batch = writeBatch(syncState.db);
+      const localIds = new Set(state.entries.map((entry) => entry.id));
+
+      snapshot.docs.forEach((entryDoc) => {
+        if (!localIds.has(entryDoc.id)) {
+          batch.delete(entryDoc.ref);
+        }
+      });
+
+      state.entries.forEach((entry) => {
+        batch.set(doc(entriesRef, entry.id), normalizeEntryForSave(entry), { merge: true });
+      });
+
+      await Promise.all([setDoc(settingsRef, sanitizeSettings(state.settings), { merge: true }), batch.commit()]);
+      setCloudUi("synced", "云端已同步。");
+    } catch (error) {
+      console.error(error);
+      setCloudUi("error", "同步失败，请稍后重试。");
+    }
+  }
+
+  function scheduleCloudSave() {
+    if (!syncState.ready) return;
+    clearTimeout(syncState.pendingTimer);
+    syncState.pendingTimer = setTimeout(syncCloudFromLocal, 650);
+    setCloudUi("checking", "等待同步...");
+  }
+
+  function renderCloudUi() {
+    if (!syncState.configured) {
+      setCloudUi("local", "未配置 Firebase，当前使用本地保存。");
+      return;
+    }
+    if (!syncState.user) {
+      setCloudUi("local", "登录后可在不同设备同步记录。");
+      els.signInBtn.hidden = false;
+      els.signOutBtn.hidden = true;
+      els.syncNowBtn.hidden = true;
+      return;
+    }
+    setCloudUi("synced", `已登录：${syncState.user.displayName || syncState.user.email || "Google 账号"}`);
+    els.signInBtn.hidden = true;
+    els.signOutBtn.hidden = false;
+    els.syncNowBtn.hidden = false;
+  }
+
+  function setCloudUi(status, message) {
+    const badgeText = {
+      checking: "同步中",
+      error: "异常",
+      local: "本地",
+      synced: "云端",
+    };
+    els.cloudBadge.textContent = badgeText[status] || "本地";
+    els.cloudBadge.dataset.status = status;
+    els.cloudStatus.textContent = message;
+    if (!syncState.configured) {
+      els.signInBtn.hidden = true;
+      els.signOutBtn.hidden = true;
+      els.syncNowBtn.hidden = true;
+      return;
+    }
+    if (status !== "local" || syncState.configured) {
+      els.signInBtn.hidden = syncState.ready;
+      els.signOutBtn.hidden = !syncState.ready;
+      els.syncNowBtn.hidden = !syncState.ready;
+    }
+    window.lucide && window.lucide.createIcons();
+  }
+
+  function authErrorMessage(error) {
+    const code = error && error.code ? `（${error.code}）` : "";
+    return `登录失败${code}。请确认 Firebase 已启用 Google 登录，并添加 GitHub Pages 授权域名。`;
+  }
+
   function analyzeEntries() {
     const threshold = state.settings.driftThreshold;
     const targetBed = normalizeNightTime(state.settings.targetBed, "bed");
@@ -536,7 +734,7 @@
         state.settings = { ...defaultSettings, ...(payload.settings || {}) };
         sortEntries();
         persistEntries();
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+        persistSettings();
         hydrateForms();
         render();
       } catch (error) {
@@ -551,7 +749,7 @@
   function loadEntries() {
     try {
       const entries = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
-      return Array.isArray(entries) ? entries.filter(isValidEntry).sort(byDate) : [];
+      return Array.isArray(entries) ? entries.filter(isValidEntry).sort(byDateValue) : [];
     } catch {
       return [];
     }
@@ -577,13 +775,56 @@
 
   function persistEntries() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state.entries));
+    scheduleCloudSave();
+  }
+
+  function persistSettings() {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+    scheduleCloudSave();
+  }
+
+  function persistLocalOnly() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state.entries));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+  }
+
+  function mergeEntries(localEntries, cloudEntries) {
+    const byDate = new Map();
+    [...localEntries, ...cloudEntries].filter(isValidEntry).forEach((entry) => {
+      const normalized = normalizeEntryForSave(entry);
+      const current = byDate.get(normalized.date);
+      if (!current || new Date(normalized.updatedAt || 0) >= new Date(current.updatedAt || 0)) {
+        byDate.set(normalized.date, normalized);
+      }
+    });
+    return Array.from(byDate.values()).sort(byDateValue);
+  }
+
+  function sanitizeSettings(settings) {
+    return {
+      targetBed: isTime(settings.targetBed) ? settings.targetBed : defaultSettings.targetBed,
+      targetWake: isTime(settings.targetWake) ? settings.targetWake : defaultSettings.targetWake,
+      driftThreshold: Number(settings.driftThreshold) || defaultSettings.driftThreshold,
+    };
+  }
+
+  function normalizeEntryForSave(entry) {
+    return {
+      id: entry.id,
+      date: entry.date,
+      bedTime: entry.bedTime,
+      wakeTime: entry.wakeTime,
+      tags: Array.isArray(entry.tags) ? entry.tags.filter((tag) => tags.includes(tag)) : [],
+      note: entry.note || "",
+      updatedAt: entry.updatedAt || new Date().toISOString(),
+    };
   }
 
   function sortEntries() {
-    state.entries.sort(byDate);
+    state.entries.sort(byDateValue);
   }
 
-  function byDate(a, b) {
+  function byDateValue(a, b) {
     return a.date.localeCompare(b.date);
   }
 
