@@ -27,6 +27,7 @@
     provider: null,
     firebase: null,
     pendingTimer: 0,
+    googleReady: false,
   };
 
   const $ = (selector) => document.querySelector(selector);
@@ -59,11 +60,13 @@
     signInBtn: $("#signInBtn"),
     signOutBtn: $("#signOutBtn"),
     syncNowBtn: $("#syncNowBtn"),
+    googleButtonHost: $("#googleButtonHost"),
   };
 
   init();
 
   function init() {
+    ensureCloudElements();
     renderTags();
     hydrateForms();
     bindEvents();
@@ -93,6 +96,16 @@
         els.tooltip.hidden = true;
       }
     });
+  }
+
+  function ensureCloudElements() {
+    if (!els.googleButtonHost && els.signInBtn) {
+      els.googleButtonHost = document.createElement("div");
+      els.googleButtonHost.className = "google-button-host";
+      els.googleButtonHost.id = "googleButtonHost";
+      els.googleButtonHost.hidden = true;
+      els.signInBtn.before(els.googleButtonHost);
+    }
   }
 
   function renderTags(selected = []) {
@@ -476,6 +489,7 @@
       syncState.provider = new authModule.GoogleAuthProvider();
       syncState.firebase = { auth: authModule, firestore: firestoreModule };
       syncState.configured = true;
+      await initGoogleIdentity(config.googleClientId);
 
       authModule.onAuthStateChanged(syncState.auth, async (user) => {
         syncState.user = user;
@@ -497,6 +511,43 @@
     setCloudUi("checking", "正在打开 Google 登录...");
     try {
       await syncState.firebase.auth.signInWithPopup(syncState.auth, syncState.provider);
+    } catch (error) {
+      console.error(error);
+      setCloudUi("error", authErrorMessage(error));
+    }
+  }
+
+  async function initGoogleIdentity(clientId) {
+    if (!clientId) return;
+    try {
+      await loadScript("https://accounts.google.com/gsi/client");
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: handleGoogleIdentityCredential,
+      });
+      window.google.accounts.id.renderButton(els.googleButtonHost, {
+        shape: "rectangular",
+        size: "large",
+        text: "signin_with",
+        theme: "outline",
+        width: 245,
+      });
+      syncState.googleReady = true;
+    } catch (error) {
+      console.error(error);
+      syncState.googleReady = false;
+    }
+  }
+
+  async function handleGoogleIdentityCredential(response) {
+    if (!response || !response.credential || !syncState.firebase) {
+      setCloudUi("error", "Google 登录没有返回凭证，请重试。");
+      return;
+    }
+    setCloudUi("checking", "正在完成登录...");
+    try {
+      const credential = syncState.firebase.auth.GoogleAuthProvider.credential(response.credential);
+      await syncState.firebase.auth.signInWithCredential(syncState.auth, credential);
     } catch (error) {
       console.error(error);
       setCloudUi("error", authErrorMessage(error));
@@ -586,13 +637,15 @@
     }
     if (!syncState.user) {
       setCloudUi("local", "登录后可在不同设备同步记录。");
-      els.signInBtn.hidden = false;
+      els.googleButtonHost.hidden = !syncState.googleReady;
+      els.signInBtn.hidden = syncState.googleReady;
       els.signOutBtn.hidden = true;
       els.syncNowBtn.hidden = true;
       return;
     }
     setCloudUi("synced", `已登录：${syncState.user.displayName || syncState.user.email || "Google 账号"}`);
     els.signInBtn.hidden = true;
+    els.googleButtonHost.hidden = true;
     els.signOutBtn.hidden = false;
     els.syncNowBtn.hidden = false;
   }
@@ -609,12 +662,14 @@
     els.cloudStatus.textContent = message;
     if (!syncState.configured) {
       els.signInBtn.hidden = true;
+      els.googleButtonHost.hidden = true;
       els.signOutBtn.hidden = true;
       els.syncNowBtn.hidden = true;
       return;
     }
     if (status !== "local" || syncState.configured) {
       els.signInBtn.hidden = syncState.ready;
+      els.googleButtonHost.hidden = syncState.ready || !syncState.googleReady;
       els.signOutBtn.hidden = !syncState.ready;
       els.syncNowBtn.hidden = !syncState.ready;
     }
@@ -630,6 +685,24 @@
       return "登录窗口已关闭，请重新点击 Google 登录。";
     }
     return `登录失败${code}。请确认 Firebase 已启用 Google 登录，并添加 GitHub Pages 授权域名。`;
+  }
+
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector(`script[src="${src}"]`);
+      if (existing) {
+        existing.addEventListener("load", resolve, { once: true });
+        if (window.google) resolve();
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = src;
+      script.async = true;
+      script.defer = true;
+      script.onload = resolve;
+      script.onerror = reject;
+      document.head.append(script);
+    });
   }
 
   function analyzeEntries() {

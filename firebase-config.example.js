@@ -5,4 +5,5 @@ export const firebaseConfig = {
   storageBucket: "YOUR_PROJECT_ID.firebasestorage.app",
   messagingSenderId: "YOUR_SENDER_ID",
   appId: "YOUR_APP_ID",
+  googleClientId: "YOUR_GOOGLE_WEB_CLIENT_ID.apps.googleusercontent.com",
 };

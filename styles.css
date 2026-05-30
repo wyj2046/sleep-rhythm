@@ -356,6 +356,10 @@ textarea:focus {
   gap: 8px;
 }
 
+.google-button-host {
+  min-height: 40px;
+}
+
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
