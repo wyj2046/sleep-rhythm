@@ -292,7 +292,7 @@
 
     const anomalyItems = items
       .map((item, index) => ({ item, index }))
-      .filter(({ item }) => item.anomalyReasons.length);
+      .filter(({ item }) => item.targetReasons.length);
     anomalyItems.forEach(({ item }, index) => {
       item.eventNumber = index + 1;
       item.eventSummary = summarizeEventLabel(item);
@@ -306,7 +306,7 @@
       .join("");
     const timeLabels = items
       .map((item, index) => {
-        if (items.length > 10 && !item.anomalyReasons.length) return "";
+        if (items.length > 10 && !item.targetReasons.length) return "";
         const labelX = x(index);
         return `
           <text class="time-label sleep-label" x="${labelX}" y="${y(item.bedNorm) - 12}" text-anchor="middle">${item.bedTime}</text>
@@ -350,7 +350,7 @@
   }
 
   function pointMarkup(item, index, cx, cy, kind) {
-    const isAlert = item.anomalyReasons.length;
+    const isAlert = item.targetReasons.length;
     const className = `point ${kind}${isAlert ? " alert" : ""}`;
     const marker = isAlert
       ? `
@@ -399,7 +399,7 @@
     const item = analysis.items[Number(point.dataset.index)];
     const kind = point.dataset.kind === "sleep" ? "入睡" : "起床";
     const time = point.dataset.kind === "sleep" ? item.bedTime : item.wakeTime;
-    const reasons = item.anomalyReasons.length ? item.anomalyReasons.join("、") : "节奏稳定";
+    const reasons = item.targetReasons.length ? item.targetReasons.join("、") : "目标范围内";
     els.tooltip.innerHTML = `
       <strong>${formatDate(item.date)} ${kind} ${time}</strong><br>
       睡眠 ${formatDuration(item.duration)}<br>
@@ -414,7 +414,7 @@
   function showEventTooltip(event) {
     const analysis = analyzeEntries();
     const item = analysis.items[Number(event.currentTarget.dataset.index)];
-    const reasons = item.anomalyReasons.length ? item.anomalyReasons.join("、") : "节奏稳定";
+    const reasons = item.targetReasons.length ? item.targetReasons.join("、") : "目标范围内";
     els.tooltip.innerHTML = `
       <strong>${formatDate(item.date)} · 异常 ${item.eventNumber || ""}</strong><br>
       入睡 ${item.bedTime} · 起床 ${item.wakeTime} · ${formatDuration(item.duration)}<br>
@@ -439,9 +439,9 @@
   }
 
   function renderAnomalies(analysis) {
-    const anomalies = analysis.items.filter((item) => item.anomalyReasons.length).reverse();
+    const anomalies = analysis.items.filter((item) => item.targetReasons.length).reverse();
     if (!anomalies.length) {
-      els.anomalyList.innerHTML = '<p class="muted">暂无明显波动。</p>';
+      els.anomalyList.innerHTML = '<p class="muted">暂无明显偏离。</p>';
       return;
     }
 
@@ -452,7 +452,7 @@
             <p class="item-title">${formatDate(item.date)}</p>
             <p class="item-meta">入睡 ${item.bedTime} · 起床 ${item.wakeTime} · ${formatDuration(item.duration)}</p>
             <div class="reason-list">
-              ${item.anomalyReasons.map((reason) => `<span class="reason-pill">${escapeHtml(reason)}</span>`).join("")}
+              ${item.targetReasons.map((reason) => `<span class="reason-pill">${escapeHtml(reason)}</span>`).join("")}
             </div>
             ${item.note ? `<p class="note-text">${escapeHtml(item.note)}</p>` : ""}
           </article>
@@ -781,24 +781,11 @@
       const bedNorm = normalizeNightTime(entry.bedTime, "bed");
       const wakeNorm = normalizeNightTime(entry.wakeTime, "wake");
       const duration = wakeNorm >= bedNorm ? wakeNorm - bedNorm : wakeNorm + 24 * 60 - bedNorm;
-      const previous = entries[index - 1];
       const targetReasons = [];
-      const driftReasons = [];
 
       if (bedNorm - targetBed > threshold) targetReasons.push(`晚睡 ${formatDelta(bedNorm - targetBed)}`);
       if (wakeNorm - targetWake > threshold) targetReasons.push(`晚起 ${formatDelta(wakeNorm - targetWake)}`);
       if (duration < 6 * 60) targetReasons.push("睡眠不足 6 小时");
-
-      if (previous) {
-        const previousBed = normalizeNightTime(previous.bedTime, "bed");
-        const previousWake = normalizeNightTime(previous.wakeTime, "wake");
-        if (Math.abs(bedNorm - previousBed) > threshold) {
-          driftReasons.push(`入睡波动 ${formatDelta(Math.abs(bedNorm - previousBed))}`);
-        }
-        if (Math.abs(wakeNorm - previousWake) > threshold) {
-          driftReasons.push(`起床波动 ${formatDelta(Math.abs(wakeNorm - previousWake))}`);
-        }
-      }
 
       return {
         ...entry,
@@ -807,8 +794,6 @@
         wakeNorm,
         duration,
         targetReasons,
-        driftReasons,
-        anomalyReasons: [...targetReasons, ...driftReasons],
         stable: targetReasons.length === 0,
       };
     });
