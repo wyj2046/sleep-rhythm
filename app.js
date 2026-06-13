@@ -295,7 +295,7 @@
       .filter(({ item }) => item.anomalyReasons.length);
     anomalyItems.forEach(({ item }, index) => {
       item.eventNumber = index + 1;
-      item.eventSummary = summarizeEvent(item);
+      item.eventSummary = summarizeEventLabel(item);
     });
 
     const sleepPoints = items
@@ -379,8 +379,8 @@
   }
 
   function eventCalloutMarkup(item, index, anchorX, labelY, connectorY, width, margin) {
-    const text = `${item.eventNumber} ${item.eventSummary}`;
-    const labelWidth = Math.min(176, Math.max(78, text.length * 13 + 22));
+    const text = item.eventSummary ? `${item.eventNumber} ${item.eventSummary}` : String(item.eventNumber);
+    const labelWidth = Math.min(118, Math.max(30, text.length * 13 + 20));
     const labelX = clamp(anchorX - labelWidth / 2, margin.left, width - margin.right - labelWidth);
     const textX = labelX + 10;
     const labelHeight = 26;
@@ -416,7 +416,7 @@
     const item = analysis.items[Number(event.currentTarget.dataset.index)];
     const reasons = item.anomalyReasons.length ? item.anomalyReasons.join("、") : "节奏稳定";
     els.tooltip.innerHTML = `
-      <strong>${formatDate(item.date)} · ${escapeHtml(summarizeEvent(item))}</strong><br>
+      <strong>${formatDate(item.date)} · 异常 ${item.eventNumber || ""}</strong><br>
       入睡 ${item.bedTime} · 起床 ${item.wakeTime} · ${formatDuration(item.duration)}<br>
       ${escapeHtml(reasons)}
       ${item.tags.length ? `<br>事件：${escapeHtml(item.tags.join("、"))}` : ""}
@@ -1056,23 +1056,8 @@
     return /^\d{2}:\d{2}$/.test(value);
   }
 
-  function summarizeEvent(item) {
-    const tagText = item.tags && item.tags.length ? item.tags.join("/") : "";
-    const noteText = compactText(item.note || "", 8);
-    const reasonText = compactText(item.targetReasons[0] || item.driftReasons[0] || "波动", 8);
-    if (tagText && noteText) return `${tagText}：${noteText}`;
-    if (tagText) return tagText;
-    if (noteText) return noteText;
-    return reasonText;
-  }
-
-  function compactText(value, maxLength) {
-    const text = String(value || "")
-      .replace(/\s+/g, " ")
-      .replace(/[，。！？；、,.!?;:：-]+$/g, "")
-      .trim();
-    if (!text) return "";
-    return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+  function summarizeEventLabel(item) {
+    return item.tags && item.tags.length ? item.tags.join("/") : "";
   }
 
   function clamp(value, min, max) {
