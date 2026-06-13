@@ -2,7 +2,7 @@
   const STORAGE_KEY = "sleep-rhythm.entries.v1";
   const SETTINGS_KEY = "sleep-rhythm.settings.v1";
   const FIREBASE_SDK_VERSION = "12.13.0";
-  const tags = ["工作", "娱乐", "运动", "社交", "补觉", "折腾", "去医院"];
+  const tags = ["工作", "娱乐", "运动", "社交", "补觉", "折腾", "去医院", "生病", "失眠"];
   const legacyDefaultSettings = {
     targetBed: "23:30",
     targetWake: "07:30",
