@@ -2,7 +2,7 @@
   const STORAGE_KEY = "sleep-rhythm.entries.v1";
   const SETTINGS_KEY = "sleep-rhythm.settings.v1";
   const FIREBASE_SDK_VERSION = "12.13.0";
-  const tags = ["工作", "娱乐", "运动", "社交", "补觉", "折腾"];
+  const tags = ["工作", "娱乐", "运动", "社交", "补觉", "折腾", "去医院"];
   const legacyDefaultSettings = {
     targetBed: "23:30",
     targetWake: "07:30",
@@ -290,11 +290,19 @@
       })
       .join("");
 
+    const anomalyItems = items
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => item.anomalyReasons.length);
+    anomalyItems.forEach(({ item }, index) => {
+      item.eventNumber = index + 1;
+      item.eventSummary = summarizeEvent(item);
+    });
+
     const sleepPoints = items
-      .map((item, index) => pointMarkup(item, index, x(index), y(item.bedNorm), "sleep", item.anomalyReasons.length))
+      .map((item, index) => pointMarkup(item, index, x(index), y(item.bedNorm), "sleep"))
       .join("");
     const wakePoints = items
-      .map((item, index) => pointMarkup(item, index, x(index), y(item.wakeNorm), "wake", item.anomalyReasons.length))
+      .map((item, index) => pointMarkup(item, index, x(index), y(item.wakeNorm), "wake"))
       .join("");
     const timeLabels = items
       .map((item, index) => {
@@ -304,6 +312,13 @@
           <text class="time-label sleep-label" x="${labelX}" y="${y(item.bedNorm) - 12}" text-anchor="middle">${item.bedTime}</text>
           <text class="time-label wake-label" x="${labelX}" y="${y(item.wakeNorm) + 20}" text-anchor="middle">${item.wakeTime}</text>
         `;
+      })
+      .join("");
+    const eventCallouts = anomalyItems
+      .map(({ item, index }) => {
+        const anchorX = x(index);
+        const anchorY = Math.min(y(item.bedNorm), y(item.wakeNorm));
+        return eventCalloutMarkup(item, index, anchorX, Math.max(margin.top + 2, anchorY - 42), anchorY - 9, width, margin);
       })
       .join("");
 
@@ -316,6 +331,7 @@
       ${sleepPoints}
       ${wakePoints}
       ${timeLabels}
+      ${eventCallouts}
       ${dateLabels}
     `;
 
@@ -325,10 +341,29 @@
       point.addEventListener("mouseleave", hideTooltip);
       point.addEventListener("click", showPointTooltip);
     });
+    els.chart.querySelectorAll(".event-callout").forEach((callout) => {
+      callout.addEventListener("mouseenter", showEventTooltip);
+      callout.addEventListener("mousemove", moveTooltip);
+      callout.addEventListener("mouseleave", hideTooltip);
+      callout.addEventListener("click", showEventTooltip);
+    });
   }
 
-  function pointMarkup(item, index, cx, cy, kind, isAlert) {
+  function pointMarkup(item, index, cx, cy, kind) {
+    const isAlert = item.anomalyReasons.length;
     const className = `point ${kind}${isAlert ? " alert" : ""}`;
+    const marker = isAlert
+      ? `
+        <text
+          class="point-number"
+          x="${cx}"
+          y="${cy + 4}"
+          text-anchor="middle"
+          data-index="${index}"
+          data-kind="${kind}"
+        >${item.eventNumber}</text>
+      `
+      : "";
     return `
       <circle
         class="${className}"
@@ -339,6 +374,22 @@
         data-kind="${kind}"
         tabindex="0"
       ></circle>
+      ${marker}
+    `;
+  }
+
+  function eventCalloutMarkup(item, index, anchorX, labelY, connectorY, width, margin) {
+    const text = `${item.eventNumber} ${item.eventSummary}`;
+    const labelWidth = Math.min(176, Math.max(78, text.length * 13 + 22));
+    const labelX = clamp(anchorX - labelWidth / 2, margin.left, width - margin.right - labelWidth);
+    const textX = labelX + 10;
+    const labelHeight = 26;
+    return `
+      <g class="event-callout" data-index="${index}" tabindex="0">
+        <line class="event-connector" x1="${anchorX}" y1="${labelY + labelHeight}" x2="${anchorX}" y2="${connectorY}"></line>
+        <rect class="event-pill" x="${labelX}" y="${labelY}" width="${labelWidth}" height="${labelHeight}" rx="13"></rect>
+        <text class="event-text" x="${textX}" y="${labelY + 17}">${escapeSvgText(text)}</text>
+      </g>
     `;
   }
 
@@ -353,6 +404,22 @@
       <strong>${formatDate(item.date)} ${kind} ${time}</strong><br>
       睡眠 ${formatDuration(item.duration)}<br>
       ${escapeHtml(reasons)}
+      ${item.tags.length ? `<br>事件：${escapeHtml(item.tags.join("、"))}` : ""}
+      ${item.note ? `<br>${escapeHtml(item.note)}` : ""}
+    `;
+    els.tooltip.hidden = false;
+    moveTooltip(event);
+  }
+
+  function showEventTooltip(event) {
+    const analysis = analyzeEntries();
+    const item = analysis.items[Number(event.currentTarget.dataset.index)];
+    const reasons = item.anomalyReasons.length ? item.anomalyReasons.join("、") : "节奏稳定";
+    els.tooltip.innerHTML = `
+      <strong>${formatDate(item.date)} · ${escapeHtml(summarizeEvent(item))}</strong><br>
+      入睡 ${item.bedTime} · 起床 ${item.wakeTime} · ${formatDuration(item.duration)}<br>
+      ${escapeHtml(reasons)}
+      ${item.tags.length ? `<br>事件：${escapeHtml(item.tags.join("、"))}` : ""}
       ${item.note ? `<br>${escapeHtml(item.note)}` : ""}
     `;
     els.tooltip.hidden = false;
@@ -989,11 +1056,38 @@
     return /^\d{2}:\d{2}$/.test(value);
   }
 
+  function summarizeEvent(item) {
+    const tagText = item.tags && item.tags.length ? item.tags.join("/") : "";
+    const noteText = compactText(item.note || "", 8);
+    const reasonText = compactText(item.targetReasons[0] || item.driftReasons[0] || "波动", 8);
+    if (tagText && noteText) return `${tagText}：${noteText}`;
+    if (tagText) return tagText;
+    if (noteText) return noteText;
+    return reasonText;
+  }
+
+  function compactText(value, maxLength) {
+    const text = String(value || "")
+      .replace(/\s+/g, " ")
+      .replace(/[，。！？；、,.!?;:：-]+$/g, "")
+      .trim();
+    if (!text) return "";
+    return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
   function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, (char) => {
       const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
       return map[char];
     });
+  }
+
+  function escapeSvgText(value) {
+    return escapeHtml(value);
   }
 
   function makeId() {
