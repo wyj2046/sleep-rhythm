@@ -565,6 +565,13 @@ textarea:focus {
   line-height: 1.45;
 }
 
+.tooltip-hint {
+  display: inline-block;
+  margin-top: 4px;
+  color: var(--green);
+  font-weight: 900;
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: minmax(260px, 0.9fr) minmax(320px, 1.1fr);

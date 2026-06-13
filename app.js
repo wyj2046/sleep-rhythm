@@ -340,13 +340,13 @@
       point.addEventListener("mouseenter", showPointTooltip);
       point.addEventListener("mousemove", moveTooltip);
       point.addEventListener("mouseleave", hideTooltip);
-      point.addEventListener("click", showPointTooltip);
+      point.addEventListener("click", editChartEntry);
     });
     els.chart.querySelectorAll(".event-callout").forEach((callout) => {
       callout.addEventListener("mouseenter", showEventTooltip);
       callout.addEventListener("mousemove", moveTooltip);
       callout.addEventListener("mouseleave", hideTooltip);
-      callout.addEventListener("click", showEventTooltip);
+      callout.addEventListener("click", editChartEntry);
     });
   }
 
@@ -407,6 +407,7 @@
       ${escapeHtml(reasons)}
       ${item.tags.length ? `<br>事件：${escapeHtml(item.tags.join("、"))}` : ""}
       ${item.note ? `<br>${escapeHtml(item.note)}` : ""}
+      <br><span class="tooltip-hint">点击可编辑这一天</span>
     `;
     els.tooltip.hidden = false;
     moveTooltip(event);
@@ -422,9 +423,19 @@
       ${escapeHtml(reasons)}
       ${item.tags.length ? `<br>事件：${escapeHtml(item.tags.join("、"))}` : ""}
       ${item.note ? `<br>${escapeHtml(item.note)}` : ""}
+      <br><span class="tooltip-hint">点击可编辑这一天</span>
     `;
     els.tooltip.hidden = false;
     moveTooltip(event);
+  }
+
+  function editChartEntry(event) {
+    const analysis = analyzeEntries();
+    const item = analysis.items[Number(event.currentTarget.dataset.index)];
+    const entry = state.entries.find((record) => record.id === item.id);
+    if (!entry) return;
+    hideTooltip();
+    editEntry(entry);
   }
 
   function moveTooltip(event) {
