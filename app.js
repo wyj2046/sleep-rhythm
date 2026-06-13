@@ -6,11 +6,12 @@
   const legacyDefaultSettings = {
     targetBed: "23:30",
     targetWake: "07:30",
+    driftThreshold: 45,
   };
   const defaultSettings = {
     targetBed: "23:00",
     targetWake: "07:00",
-    driftThreshold: 45,
+    driftThreshold: 30,
   };
 
   const state = {
@@ -642,7 +643,7 @@
       const cloudEntries = entriesSnapshot.docs.map((entryDoc) => ({ id: entryDoc.id, ...entryDoc.data() }));
 
       if (cloudSettings) {
-        state.settings = sanitizeSettings(cloudSettings);
+        state.settings = sanitizeSettings(cloudSettings, { migrateLegacyThreshold: true });
       }
       state.entries = mergeEntries(state.entries, cloudEntries);
       sortEntries();
@@ -857,7 +858,7 @@
         const payload = JSON.parse(reader.result);
         if (!Array.isArray(payload.entries)) throw new Error("missing entries");
         state.entries = payload.entries.filter(isValidEntry);
-        state.settings = { ...defaultSettings, ...(payload.settings || {}) };
+        state.settings = sanitizeSettings(payload.settings || {});
         sortEntries();
         persistEntries();
         persistSettings();
@@ -887,9 +888,9 @@
       const isOldDefault =
         stored.targetBed === legacyDefaultSettings.targetBed && stored.targetWake === legacyDefaultSettings.targetWake;
       if (isOldDefault) {
-        return { ...defaultSettings, driftThreshold: stored.driftThreshold || defaultSettings.driftThreshold };
+        return { ...defaultSettings };
       }
-      return { ...defaultSettings, ...stored };
+      return sanitizeSettings(stored, { migrateLegacyThreshold: true });
     } catch {
       return { ...defaultSettings };
     }
@@ -926,11 +927,15 @@
     return Array.from(byDate.values()).sort(byDateValue);
   }
 
-  function sanitizeSettings(settings) {
+  function sanitizeSettings(settings, options = {}) {
+    const threshold = Number(settings.driftThreshold) || defaultSettings.driftThreshold;
     return {
       targetBed: isTime(settings.targetBed) ? settings.targetBed : defaultSettings.targetBed,
       targetWake: isTime(settings.targetWake) ? settings.targetWake : defaultSettings.targetWake,
-      driftThreshold: Number(settings.driftThreshold) || defaultSettings.driftThreshold,
+      driftThreshold:
+        options.migrateLegacyThreshold && threshold === legacyDefaultSettings.driftThreshold
+          ? defaultSettings.driftThreshold
+          : threshold,
     };
   }
 
