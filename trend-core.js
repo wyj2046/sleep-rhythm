@@ -149,6 +149,10 @@
     return groups;
   }
 
+  function sortMonthsNewestFirst(months) {
+    return months.slice().sort((a, b) => b.key.localeCompare(a.key));
+  }
+
   function median(values) {
     if (!values.length) return null;
     const sorted = values.slice().sort((a, b) => a - b);
@@ -188,6 +192,10 @@
       .join(" ");
   }
 
+  function makeContinuousPath(points) {
+    return makeSegmentedPath(points.filter((point) => point && Number.isFinite(point[0]) && Number.isFinite(point[1])));
+  }
+
   function getChartRange(items, settings) {
     const values = items.flatMap((item) => [item.bedNorm, item.wakeNorm]);
     const targetValues = [normalizeNightTime(settings.targetBed, "bed"), normalizeNightTime(settings.targetWake, "wake")];
@@ -211,9 +219,11 @@
     dayNumberToDate,
     buildCalendarTimeline,
     groupTimelineByMonth,
+    sortMonthsNewestFirst,
     median,
     addRollingMedians,
     makeSegmentedPath,
+    makeContinuousPath,
     getChartRange,
   };
 });

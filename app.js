@@ -12,7 +12,7 @@
   };
   const defaultSettings = {
     targetBed: "23:00",
-    targetWake: "07:00",
+    targetWake: "06:30",
     driftThreshold: 30,
   };
   const trendCore = window.SleepTrendCore;
@@ -300,7 +300,8 @@
   function buildTrendModel(analysis) {
     const items = trendCore.dedupeEntriesByDate(analysis.items).sort(byDateValue);
     const timeline = trendCore.addRollingMedians(trendCore.buildCalendarTimeline(items));
-    const months = trendCore.groupTimelineByMonth(timeline);
+    const chronologicalMonths = trendCore.groupTimelineByMonth(timeline);
+    const months = trendCore.sortMonthsNewestFirst(chronologicalMonths);
     const itemByDate = new Map(items.map((item) => [item.date, item]));
     const anomalies = items.filter((item) => item.targetReasons.length);
     const range = trendCore.getChartRange(items, state.settings);
@@ -312,6 +313,7 @@
     return {
       items,
       timeline,
+      chronologicalMonths,
       months,
       itemByDate,
       anomalies,
@@ -350,20 +352,20 @@
     const plotHeight = height - margin.top - margin.bottom;
     const x = (index) => margin.left + (model.timeline.length === 1 ? plotWidth / 2 : (index / (model.timeline.length - 1)) * plotWidth);
     const y = (minutes) => margin.top + ((minutes - model.range.min) / (model.range.max - model.range.min)) * plotHeight;
-    const bedPath = trendCore.makeSegmentedPath(model.timeline.map((day, index) => (day.item ? [x(index), y(day.item.bedNorm)] : null)));
-    const wakePath = trendCore.makeSegmentedPath(model.timeline.map((day, index) => (day.item ? [x(index), y(day.item.wakeNorm)] : null)));
-    const bedMedian = trendCore.makeSegmentedPath(
+    const bedPath = trendCore.makeContinuousPath(model.timeline.map((day, index) => (day.item ? [x(index), y(day.item.bedNorm)] : null)));
+    const wakePath = trendCore.makeContinuousPath(model.timeline.map((day, index) => (day.item ? [x(index), y(day.item.wakeNorm)] : null)));
+    const bedMedian = trendCore.makeContinuousPath(
       model.timeline.map((day, index) => (trendUi.showMedian && Number.isFinite(day.bedMedian) ? [x(index), y(day.bedMedian)] : null)),
     );
-    const wakeMedian = trendCore.makeSegmentedPath(
+    const wakeMedian = trendCore.makeContinuousPath(
       model.timeline.map((day, index) => (trendUi.showMedian && Number.isFinite(day.wakeMedian) ? [x(index), y(day.wakeMedian)] : null)),
     );
     const maxMonthLabels = Math.max(2, Math.floor(plotWidth / 76));
-    const monthLabelStep = Math.max(1, Math.ceil(model.months.length / maxMonthLabels));
-    const spansYears = new Set(model.months.map((month) => month.year)).size > 1;
-    const monthLabels = model.months
+    const monthLabelStep = Math.max(1, Math.ceil(model.chronologicalMonths.length / maxMonthLabels));
+    const spansYears = new Set(model.chronologicalMonths.map((month) => month.year)).size > 1;
+    const monthLabels = model.chronologicalMonths
       .map((month, monthIndex) => {
-        if (monthIndex % monthLabelStep !== 0 && monthIndex !== model.months.length - 1) return "";
+        if (monthIndex % monthLabelStep !== 0 && monthIndex !== model.chronologicalMonths.length - 1) return "";
         const index = model.timeline.findIndex((day) => day.monthKey === month.key);
         const label = spansYears && (month.month === 1 || monthIndex === 0) ? `${month.year}年${month.month}月` : `${month.month}月`;
         return `<text class="overview-date-label" x="${x(index)}" y="${height - 6}" text-anchor="start">${label}</text>`;
@@ -477,10 +479,10 @@
     const dateLabels = tickIndexes
       .map((index) => `<text class="month-date-label" x="${x(index)}" y="${height - 7}" text-anchor="middle">${month.days[index].dayOfMonth}</text>`)
       .join("");
-    const sleepPath = trendCore.makeSegmentedPath(month.days.map((day, index) => (day.item ? [x(index), y(day.item.bedNorm)] : null)));
-    const wakePath = trendCore.makeSegmentedPath(month.days.map((day, index) => (day.item ? [x(index), y(day.item.wakeNorm)] : null)));
-    const bedMedian = trendCore.makeSegmentedPath(month.days.map((day, index) => (trendUi.showMedian && Number.isFinite(day.bedMedian) ? [x(index), y(day.bedMedian)] : null)));
-    const wakeMedian = trendCore.makeSegmentedPath(month.days.map((day, index) => (trendUi.showMedian && Number.isFinite(day.wakeMedian) ? [x(index), y(day.wakeMedian)] : null)));
+    const sleepPath = trendCore.makeContinuousPath(month.days.map((day, index) => (day.item ? [x(index), y(day.item.bedNorm)] : null)));
+    const wakePath = trendCore.makeContinuousPath(month.days.map((day, index) => (day.item ? [x(index), y(day.item.wakeNorm)] : null)));
+    const bedMedian = trendCore.makeContinuousPath(month.days.map((day, index) => (trendUi.showMedian && Number.isFinite(day.bedMedian) ? [x(index), y(day.bedMedian)] : null)));
+    const wakeMedian = trendCore.makeContinuousPath(month.days.map((day, index) => (trendUi.showMedian && Number.isFinite(day.wakeMedian) ? [x(index), y(day.wakeMedian)] : null)));
     const selectedIndex = month.days.findIndex((day) => day.date === trendUi.selectedDate);
     const selected =
       selectedIndex >= 0

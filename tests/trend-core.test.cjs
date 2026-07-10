@@ -34,6 +34,7 @@ test("groups every valid observation by calendar month", () => {
   const days = core.buildCalendarTimeline(analyzed.items);
   const months = core.groupTimelineByMonth(days);
   assert.deepEqual(months.map((month) => month.key), ["2026-05", "2026-06", "2026-07"]);
+  assert.deepEqual(core.sortMonthsNewestFirst(months).map((month) => month.key), ["2026-07", "2026-06", "2026-05"]);
   assert.equal(months.reduce((sum, month) => sum + month.recordCount, 0), analyzed.items.length);
   assert.deepEqual(
     months.flatMap((month) => month.days.map((day) => day.item && day.item.id).filter(Boolean)).sort(),
@@ -41,7 +42,7 @@ test("groups every valid observation by calendar month", () => {
   );
 });
 
-test("keeps missing calendar days and breaks paths at gaps", () => {
+test("keeps missing calendar days while allowing the rendered line to bridge gaps", () => {
   const analyzed = core.analyzeEntries(
     [entry("a", "2026-06-22", "23:00"), entry("b", "2026-06-24", "23:10")],
     settings,
@@ -50,6 +51,7 @@ test("keeps missing calendar days and breaks paths at gaps", () => {
   assert.deepEqual(days.map((day) => day.date), ["2026-06-22", "2026-06-23", "2026-06-24"]);
   assert.equal(days[1].item, null);
   assert.equal(core.makeSegmentedPath([[0, 1], null, [2, 3]]), "M 0.0 1.0 M 2.0 3.0");
+  assert.equal(core.makeContinuousPath([[0, 1], null, [2, 3]]), "M 0.0 1.0 L 2.0 3.0");
 });
 
 test("computes seven-calendar-day medians across month boundaries", () => {
