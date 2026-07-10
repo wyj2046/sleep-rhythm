@@ -1,16 +1,24 @@
 # 晨昏记
 
-一个本地网页小工具，用来记录每天的入睡、起床时间，查看趋势，并标记明显波动。
+一个无构建步骤的睡眠节律记录工具，用来记录每天的入睡、起床时间，查看全部历史趋势，并标记明显波动。
 
 ## 使用
 
-直接打开 `index.html` 即可。数据保存在当前浏览器的 `localStorage` 中。
+建议在项目目录启动一个本地静态服务器：
+
+```bash
+python3 -m http.server 8765 --bind 127.0.0.1
+```
+
+然后打开 `http://127.0.0.1:8765/`。
+
+趋势页默认展示全部日期：顶部是完整历史概览，下方按自然月分章；缺失日期保留为空档，7 日中位数可独立开关。
 
 建议定期点击右上角导出 JSON，作为备份；CSV 适合拿到 Excel 或 Numbers 里继续分析。
 
 ## Firebase 云同步
 
-这版支持可选的 Firebase 云同步。未配置 Firebase 时，应用会继续使用本地保存。
+这版支持可选的 Firebase 云同步。登录并成功读取后，以 Firebase 远端快照为事实源；`localStorage` 仅作为离线缓存和明确待同步操作的队列。读取远端不会根据本地缺失项删除或整包覆盖云端数据。未配置 Firebase 时，应用继续使用本地保存。
 
 ### Firebase 控制台
 
@@ -23,3 +31,12 @@
 7. 把 `firebase-config.js` 改成你的配置。
 
 `firebase-config.js` 的格式可以参考 `firebase-config.example.js`。
+
+## 检查
+
+```bash
+node --check app.js
+node --check trend-core.js
+node --test tests/*.test.cjs
+git diff --check
+```

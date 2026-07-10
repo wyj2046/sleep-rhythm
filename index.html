@@ -4,9 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>晨昏记</title>
-    <link rel="stylesheet" href="./styles.css?v=20260613-chart-edit" />
+    <link rel="stylesheet" href="./styles.css?v=20260710-monthly-chapters" />
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
-    <script src="./app.js?v=20260613-chart-edit" defer></script>
+    <script src="./trend-core.js?v=20260710-monthly-chapters" defer></script>
+    <script src="./app.js?v=20260710-monthly-chapters" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -29,8 +30,19 @@
         </div>
       </header>
 
+      <nav class="mobile-section-nav" aria-label="主要区域">
+        <a href="#trendWorkspace">
+          <i data-lucide="chart-no-axes-combined"></i>
+          趋势
+        </a>
+        <a href="#entryForm">
+          <i data-lucide="notebook-pen"></i>
+          记录
+        </a>
+      </nav>
+
       <main class="layout">
-        <aside class="side-panel">
+        <aside class="side-panel" id="recordWorkspace">
           <section class="panel">
             <div class="panel-heading">
               <h2>记录</h2>
@@ -110,26 +122,53 @@
           </section>
         </aside>
 
-        <section class="workspace">
-          <div class="stats-grid" id="statsGrid"></div>
-
-          <section class="chart-panel">
-            <div class="panel-heading chart-heading">
+        <section class="workspace" id="trendWorkspace">
+          <section class="chart-panel trend-workspace" aria-labelledby="trendTitle">
+            <header class="trend-heading">
               <div>
-                <h2>趋势</h2>
-                <p id="rangeLabel" class="muted"></p>
+                <div class="trend-context">
+                  <span class="range-pill">全部日期</span>
+                  <span id="rangeLabel"></span>
+                </div>
+                <h2 class="trend-insight" id="trendTitle">从全部日期里看见节律</h2>
               </div>
-              <div class="legend">
-                <span><b class="dot sleep-dot"></b>入睡</span>
-                <span><b class="dot wake-dot"></b>起床</span>
-                <span><b class="dot alert-dot"></b>偏离</span>
+              <div class="trend-actions">
+                <label class="median-toggle" for="medianToggle">
+                  <span>7日中位数</span>
+                  <input id="medianToggle" type="checkbox" checked />
+                  <span class="toggle-track" aria-hidden="true"><span></span></span>
+                </label>
+                <span class="trend-source" id="trendSourceStatus" data-status="checking">
+                  <i data-lucide="cloud"></i>
+                  正在读取数据
+                </span>
               </div>
+            </header>
+
+            <section class="history-overview" aria-labelledby="overviewTitle">
+              <div class="overview-heading">
+                <h3 id="overviewTitle">全部日期趋势概览</h3>
+                <div class="legend" aria-label="图例">
+                  <span><b class="dot sleep-dot"></b>入睡</span>
+                  <span><b class="dot wake-dot"></b>起床</span>
+                  <span><b class="dot alert-dot"></b>偏离</span>
+                </div>
+              </div>
+              <svg id="trendChart" role="img" aria-labelledby="trendTitle trendDescription"></svg>
+              <p class="sr-only" id="trendDescription"></p>
+            </section>
+
+            <nav class="month-jump" id="monthJump" aria-label="按月份跳转"></nav>
+
+            <div class="trend-content">
+              <div class="month-list" id="monthCharts"></div>
+              <aside class="night-detail" id="dayDetail" aria-live="polite"></aside>
             </div>
-            <div class="chart-wrap">
-              <svg id="trendChart" role="img" aria-label="睡眠和起床时间趋势图"></svg>
-              <div id="chartTooltip" class="chart-tooltip" hidden></div>
-            </div>
+
+            <p class="chart-caveat">时间轴按本地睡眠日展示；目标参考线随当前设置更新。</p>
           </section>
+
+          <div class="stats-grid" id="statsGrid"></div>
 
           <section class="content-grid">
             <div class="panel">

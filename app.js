@@ -1,6 +1,8 @@
 (function () {
   const STORAGE_KEY = "sleep-rhythm.entries.v1";
   const SETTINGS_KEY = "sleep-rhythm.settings.v1";
+  const CHART_PREFS_KEY = "sleep-rhythm.chart-prefs.v1";
+  const CLOUD_QUEUE_KEY = "sleep-rhythm.cloud-queue.v1";
   const FIREBASE_SDK_VERSION = "12.13.0";
   const tags = ["工作", "娱乐", "运动", "社交", "补觉", "折腾", "去医院", "生病", "失眠"];
   const legacyDefaultSettings = {
@@ -13,6 +15,11 @@
     targetWake: "07:00",
     driftThreshold: 30,
   };
+  const trendCore = window.SleepTrendCore;
+
+  if (!trendCore) {
+    throw new Error("SleepTrendCore failed to load.");
+  }
 
   const state = {
     entries: loadEntries(),
@@ -29,7 +36,14 @@
     firebase: null,
     pendingTimer: 0,
     googleReady: false,
+    lastSyncAt: "",
+    flushPromise: null,
   };
+  const trendUi = {
+    selectedDate: null,
+    showMedian: loadChartPreferences().showMedian !== false,
+  };
+  const cloudQueue = loadCloudQueue();
 
   const $ = (selector) => document.querySelector(selector);
   const els = {
@@ -47,8 +61,14 @@
     driftValue: $("#driftValue"),
     statsGrid: $("#statsGrid"),
     chart: $("#trendChart"),
-    tooltip: $("#chartTooltip"),
     rangeLabel: $("#rangeLabel"),
+    trendTitle: $("#trendTitle"),
+    trendDescription: $("#trendDescription"),
+    trendSourceStatus: $("#trendSourceStatus"),
+    medianToggle: $("#medianToggle"),
+    monthJump: $("#monthJump"),
+    monthCharts: $("#monthCharts"),
+    dayDetail: $("#dayDetail"),
     anomalyList: $("#anomalyList"),
     entryList: $("#entryList"),
     resetFormBtn: $("#resetFormBtn"),
@@ -70,6 +90,8 @@
     ensureCloudElements();
     renderTags();
     hydrateForms();
+    updateTrendSourceStatus("local");
+    els.medianToggle.checked = trendUi.showMedian;
     bindEvents();
     render();
     initCloudSync();
@@ -90,12 +112,16 @@
     els.importJsonInput.addEventListener("change", importJson);
     els.signInBtn.addEventListener("click", signInWithGoogle);
     els.signOutBtn.addEventListener("click", signOutCloud);
-    els.syncNowBtn.addEventListener("click", syncCloudFromLocal);
-    window.addEventListener("resize", debounce(renderChart, 120));
+    els.syncNowBtn.addEventListener("click", refreshCloudData);
+    els.medianToggle.addEventListener("change", toggleMedian);
+    els.monthJump.addEventListener("click", handleMonthJump);
+    els.monthCharts.addEventListener("click", handleTrendClick);
+    els.monthCharts.addEventListener("keydown", handleTrendKeydown);
+    els.dayDetail.addEventListener("click", handleDetailAction);
+    window.addEventListener("resize", debounce(() => renderChart(), 120));
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") {
-        els.tooltip.hidden = true;
-      }
+      const inTrendWorkspace = event.target && event.target.closest && event.target.closest("#trendWorkspace");
+      if (event.key === "Escape" && trendUi.selectedDate && inTrendWorkspace) clearTrendSelection();
     });
   }
 
@@ -144,20 +170,30 @@
       updatedAt: new Date().toISOString(),
     };
 
+    let savedEntry = entry;
+    const replacedIds = [];
     const currentIndex = state.entries.findIndex((item) => item.id === entry.id);
     if (currentIndex >= 0) {
+      const sameDateEntry = state.entries.find((item) => item.id !== entry.id && item.date === entry.date);
+      if (sameDateEntry) replacedIds.push(sameDateEntry.id);
       state.entries[currentIndex] = entry;
+      state.entries = state.entries.filter((item) => item.id === entry.id || item.date !== entry.date);
+      savedEntry = entry;
     } else {
       const sameDateIndex = state.entries.findIndex((item) => item.date === entry.date);
       if (sameDateIndex >= 0) {
         state.entries[sameDateIndex] = { ...entry, id: state.entries[sameDateIndex].id };
+        savedEntry = state.entries[sameDateIndex];
       } else {
         state.entries.push(entry);
+        savedEntry = entry;
       }
     }
 
     sortEntries();
     persistEntries();
+    replacedIds.forEach(queueCloudDelete);
+    queueCloudUpsert(savedEntry);
     resetEntryForm();
     render();
   }
@@ -170,6 +206,7 @@
     };
     els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
     persistSettings();
+    queueCloudSettings(state.settings);
     render();
   }
 
@@ -238,216 +275,492 @@
   }
 
   function renderChart(analysis = analyzeEntries()) {
-    const items = analysis.items;
-    const rect = els.chart.getBoundingClientRect();
-    const width = Math.max(640, Math.round(rect.width || 900));
-    const height = Math.round(rect.height || 440);
-    const margin = { top: 24, right: 26, bottom: 52, left: 54 };
+    const model = buildTrendModel(analysis);
+    trendUi.model = model;
+    renderTrendHeader(model);
+
+    if (!model.items.length) {
+      const width = Math.max(280, Math.round(els.chart.getBoundingClientRect().width || 720));
+      els.chart.setAttribute("viewBox", `0 0 ${width} 100`);
+      els.chart.innerHTML = `<text x="${width / 2}" y="54" text-anchor="middle" class="empty-state">还没有记录</text>`;
+      els.monthJump.innerHTML = "";
+      els.monthCharts.innerHTML = '<p class="trend-empty">保存第一晚记录后，这里会按月展示完整节律。</p>';
+      els.dayDetail.innerHTML = "";
+      els.dayDetail.hidden = true;
+      return;
+    }
+
+    renderOverviewChart(model);
+    renderMonthJump(model);
+    renderMonthCharts(model);
+    renderDayDetail(model);
+    window.lucide && window.lucide.createIcons();
+  }
+
+  function buildTrendModel(analysis) {
+    const items = trendCore.dedupeEntriesByDate(analysis.items).sort(byDateValue);
+    const timeline = trendCore.addRollingMedians(trendCore.buildCalendarTimeline(items));
+    const months = trendCore.groupTimelineByMonth(timeline);
+    const itemByDate = new Map(items.map((item) => [item.date, item]));
+    const anomalies = items.filter((item) => item.targetReasons.length);
+    const range = trendCore.getChartRange(items, state.settings);
+
+    if (trendUi.selectedDate === null || (trendUi.selectedDate && !itemByDate.has(trendUi.selectedDate))) {
+      trendUi.selectedDate = (anomalies.at(-1) || items.at(-1) || {}).date || "";
+    }
+
+    return {
+      items,
+      timeline,
+      months,
+      itemByDate,
+      anomalies,
+      range,
+      selectedItem: trendUi.selectedDate ? itemByDate.get(trendUi.selectedDate) || null : null,
+    };
+  }
+
+  function renderTrendHeader(model) {
+    if (!model.items.length) {
+      els.rangeLabel.textContent = "";
+      els.trendTitle.textContent = "从今晚开始记录节律";
+      els.trendDescription.textContent = "还没有睡眠记录。";
+      return;
+    }
+
+    const first = model.items[0];
+    const latest = model.items.at(-1);
+    const stableDays = countStableDays(model.items);
+    const anomalyCount = model.anomalies.length;
+    els.rangeLabel.textContent = `${first.date} → ${latest.date} · 共 ${model.items.length} 晚`;
+    els.trendTitle.textContent =
+      stableDays >= 7
+        ? `过去 ${stableDays} 天节律稳定，少数夜晚形成明显断点。`
+        : anomalyCount
+          ? `节律仍在恢复，${anomalyCount} 个夜晚形成明显断点。`
+          : "节律保持稳定，继续观察长期变化。";
+    els.trendDescription.textContent = `全部日期从 ${first.date} 到 ${latest.date}，共 ${model.items.length} 晚，${anomalyCount} 晚偏离当前目标。蓝线表示入睡，红线表示起床，橙色外环表示偏离。`;
+  }
+
+  function renderOverviewChart(model) {
+    const width = Math.max(280, Math.round(els.chart.getBoundingClientRect().width || 720));
+    const height = window.innerWidth <= 760 ? 96 : 112;
+    const margin = { top: 8, right: 10, bottom: 24, left: 38 };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
-    const chartRange = getChartRange(items);
-    const minY = chartRange.min;
-    const maxY = chartRange.max;
-    const yTicks = makeHourlyTicks(minY, maxY);
-    els.chart.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    const x = (index) => margin.left + (model.timeline.length === 1 ? plotWidth / 2 : (index / (model.timeline.length - 1)) * plotWidth);
+    const y = (minutes) => margin.top + ((minutes - model.range.min) / (model.range.max - model.range.min)) * plotHeight;
+    const bedPath = trendCore.makeSegmentedPath(model.timeline.map((day, index) => (day.item ? [x(index), y(day.item.bedNorm)] : null)));
+    const wakePath = trendCore.makeSegmentedPath(model.timeline.map((day, index) => (day.item ? [x(index), y(day.item.wakeNorm)] : null)));
+    const bedMedian = trendCore.makeSegmentedPath(
+      model.timeline.map((day, index) => (trendUi.showMedian && Number.isFinite(day.bedMedian) ? [x(index), y(day.bedMedian)] : null)),
+    );
+    const wakeMedian = trendCore.makeSegmentedPath(
+      model.timeline.map((day, index) => (trendUi.showMedian && Number.isFinite(day.wakeMedian) ? [x(index), y(day.wakeMedian)] : null)),
+    );
+    const maxMonthLabels = Math.max(2, Math.floor(plotWidth / 76));
+    const monthLabelStep = Math.max(1, Math.ceil(model.months.length / maxMonthLabels));
+    const spansYears = new Set(model.months.map((month) => month.year)).size > 1;
+    const monthLabels = model.months
+      .map((month, monthIndex) => {
+        if (monthIndex % monthLabelStep !== 0 && monthIndex !== model.months.length - 1) return "";
+        const index = model.timeline.findIndex((day) => day.monthKey === month.key);
+        const label = spansYears && (month.month === 1 || monthIndex === 0) ? `${month.year}年${month.month}月` : `${month.month}月`;
+        return `<text class="overview-date-label" x="${x(index)}" y="${height - 6}" text-anchor="start">${label}</text>`;
+      })
+      .join("");
+    const anomalyMarks = model.timeline
+      .map((day, index) =>
+        day.item && day.item.targetReasons.length
+          ? `<circle class="overview-anomaly" cx="${x(index)}" cy="${y(day.item.bedNorm)}" r="3.5"></circle>`
+          : "",
+      )
+      .join("");
+    const selectedIndex = model.timeline.findIndex((day) => day.date === trendUi.selectedDate);
+    const selectedMark =
+      selectedIndex >= 0
+        ? `<line class="overview-selection" x1="${x(selectedIndex)}" y1="${margin.top}" x2="${x(selectedIndex)}" y2="${height - margin.bottom}"></line>`
+        : "";
 
-    if (!items.length) {
-      els.rangeLabel.textContent = "";
-      els.chart.innerHTML = `
-        <text x="${width / 2}" y="${height / 2}" text-anchor="middle" class="empty-state">
-          还没有记录
-        </text>
+    els.chart.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    els.chart.innerHTML = `
+      ${targetBandMarkup(y, model.range, margin.left, plotWidth)}
+      <line class="overview-guide" x1="${margin.left}" y1="${y(model.range.min)}" x2="${width - margin.right}" y2="${y(model.range.min)}"></line>
+      <line class="overview-guide" x1="${margin.left}" y1="${y(model.range.max)}" x2="${width - margin.right}" y2="${y(model.range.max)}"></line>
+      <text class="overview-axis-label" x="${margin.left - 7}" y="${y(model.range.min) + 3}" text-anchor="end">${formatAxisTime(model.range.min)}</text>
+      <text class="overview-axis-label" x="${margin.left - 7}" y="${y(model.range.max) + 3}" text-anchor="end">${formatAxisTime(model.range.max)}</text>
+      <path class="overview-line sleep" d="${bedPath}"></path>
+      <path class="overview-line wake" d="${wakePath}"></path>
+      ${trendUi.showMedian ? `<path class="overview-median sleep" d="${bedMedian}"></path><path class="overview-median wake" d="${wakeMedian}"></path>` : ""}
+      ${anomalyMarks}
+      ${selectedMark}
+      ${monthLabels}
+    `;
+  }
+
+  function renderMonthJump(model) {
+    const selectedMonth = trendUi.selectedDate ? trendUi.selectedDate.slice(0, 7) : "";
+    const spansYears = new Set(model.months.map((month) => month.year)).size > 1;
+    els.monthJump.innerHTML = model.months
+      .map(
+        (month) => `
+          <button
+            class="month-jump-button${month.key === selectedMonth ? " is-current" : ""}"
+            type="button"
+            data-month-target="${month.key}"
+            aria-label="跳转到 ${month.label}"
+            ${month.key === selectedMonth ? 'aria-current="true"' : ""}
+          >${spansYears ? `${String(month.year).slice(-2)}年` : ""}${month.month}月</button>
+        `,
+      )
+      .join("");
+  }
+
+  function renderMonthCharts(model) {
+    els.monthCharts.innerHTML = model.months.map((month) => renderMonthSection(month, model)).join("");
+  }
+
+  function renderMonthSection(month, model) {
+    const first = month.days[0].date;
+    const last = month.days.at(-1).date;
+    const anomalyText = month.anomalyCount ? ` · ${month.anomalyCount} 次偏离` : "";
+    const frame = getMonthChartFrame();
+    return `
+      <section class="month-section" id="month-${month.key}" data-month-section="${month.key}">
+        <header class="month-header">
+          <h3 class="month-title">${month.label}</h3>
+          <span class="month-meta">${shortDate(first)}–${shortDate(last)} · ${month.recordCount} 晚${anomalyText}</span>
+        </header>
+        <svg
+          class="month-chart"
+          data-month-chart="${month.key}"
+          viewBox="0 0 ${frame.width} ${frame.height}"
+          preserveAspectRatio="xMidYMid meet"
+          role="group"
+          aria-label="${month.label}睡眠趋势，共 ${month.recordCount} 晚"
+        ><title>${month.label}睡眠趋势</title><desc>蓝线表示入睡，红线表示起床，橙色外环表示偏离。可用方向键浏览记录。</desc>${renderMonthSvg(month, model, frame)}</svg>
+      </section>
+    `;
+  }
+
+  function getMonthChartFrame() {
+    const mobile = window.innerWidth <= 760;
+    return {
+      mobile,
+      width: mobile ? 360 : 820,
+      height: mobile ? 186 : 226,
+      margin: mobile
+        ? { top: 14, right: 10, bottom: 28, left: 42 }
+        : { top: 14, right: 16, bottom: 32, left: 52 },
+    };
+  }
+
+  function renderMonthSvg(month, model, frame = getMonthChartFrame()) {
+    const { mobile, width, height, margin } = frame;
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const x = (index) => margin.left + (month.days.length === 1 ? plotWidth / 2 : (index / (month.days.length - 1)) * plotWidth);
+    const y = (minutes) => margin.top + ((minutes - model.range.min) / (model.range.max - model.range.min)) * plotHeight;
+    const tickStep = mobile ? 180 : 120;
+    const yTicks = makeTimeTicks(model.range.min, model.range.max, tickStep);
+    const grid = yTicks
+      .map(
+        (tick) => `
+          <line class="month-grid-line" x1="${margin.left}" y1="${y(tick)}" x2="${width - margin.right}" y2="${y(tick)}"></line>
+          <text class="month-axis-label" x="${margin.left - 8}" y="${y(tick) + 3}" text-anchor="end">${formatAxisTime(tick)}</text>
+        `,
+      )
+      .join("");
+    const tickIndexes = month.days.length <= 7
+      ? month.days.map((_, index) => index)
+      : month.days.map((day, index) => ({ day, index })).filter(({ day, index }) => index === 0 || index === month.days.length - 1 || day.dayOfMonth % 5 === 0).map(({ index }) => index);
+    const dateLabels = tickIndexes
+      .map((index) => `<text class="month-date-label" x="${x(index)}" y="${height - 7}" text-anchor="middle">${month.days[index].dayOfMonth}</text>`)
+      .join("");
+    const sleepPath = trendCore.makeSegmentedPath(month.days.map((day, index) => (day.item ? [x(index), y(day.item.bedNorm)] : null)));
+    const wakePath = trendCore.makeSegmentedPath(month.days.map((day, index) => (day.item ? [x(index), y(day.item.wakeNorm)] : null)));
+    const bedMedian = trendCore.makeSegmentedPath(month.days.map((day, index) => (trendUi.showMedian && Number.isFinite(day.bedMedian) ? [x(index), y(day.bedMedian)] : null)));
+    const wakeMedian = trendCore.makeSegmentedPath(month.days.map((day, index) => (trendUi.showMedian && Number.isFinite(day.wakeMedian) ? [x(index), y(day.wakeMedian)] : null)));
+    const selectedIndex = month.days.findIndex((day) => day.date === trendUi.selectedDate);
+    const selected =
+      selectedIndex >= 0
+        ? `<rect class="month-selection" x="${x(selectedIndex) - 9}" y="${margin.top}" width="18" height="${plotHeight}" rx="9"></rect>`
+        : "";
+    const missing = month.days
+      .map((day, index) => (!day.item ? `<line class="missing-day" x1="${x(index)}" y1="${height - margin.bottom + 4}" x2="${x(index)}" y2="${height - margin.bottom + 10}"></line>` : ""))
+      .join("");
+    const points = month.days
+      .map((day, index) => {
+        if (!day.item) return "";
+        const item = day.item;
+        const isAlert = item.targetReasons.length > 0;
+        const isSelected = item.date === trendUi.selectedDate;
+        return `
+          <g
+            class="chart-day${isAlert ? " is-alert" : ""}${isSelected ? " is-selected" : ""}"
+            data-date="${item.date}"
+            role="button"
+            tabindex="${isAlert || isSelected ? "0" : "-1"}"
+            aria-label="${escapeHtml(trendDayAriaLabel(item))}"
+          >
+            ${isAlert ? `<circle class="anomaly-ring" cx="${x(index)}" cy="${y(item.bedNorm)}" r="7"></circle>` : ""}
+            <circle class="month-point sleep" cx="${x(index)}" cy="${y(item.bedNorm)}" r="3.7"></circle>
+            <circle class="month-point wake" cx="${x(index)}" cy="${y(item.wakeNorm)}" r="3.7"></circle>
+          </g>
+        `;
+      })
+      .join("");
+
+    return `
+      ${targetBandMarkup(y, model.range, margin.left, plotWidth)}
+      <rect
+        class="month-hit"
+        data-month="${month.key}"
+        x="${margin.left}"
+        y="${margin.top}"
+        width="${plotWidth}"
+        height="${plotHeight}"
+        tabindex="0"
+        role="button"
+        aria-label="${month.label}趋势图。使用左右方向键浏览记录，按回车查看详情。"
+      ></rect>
+      ${grid}
+      ${selected}
+      <path class="month-line sleep" d="${sleepPath}"></path>
+      <path class="month-line wake" d="${wakePath}"></path>
+      ${trendUi.showMedian ? `<path class="month-median sleep" d="${bedMedian}"></path><path class="month-median wake" d="${wakeMedian}"></path>` : ""}
+      ${missing}
+      ${points}
+      ${dateLabels}
+    `;
+  }
+
+  function targetBandMarkup(y, range, left, width) {
+    const threshold = state.settings.driftThreshold;
+    const targetBed = trendCore.normalizeNightTime(state.settings.targetBed, "bed");
+    const targetWake = trendCore.normalizeNightTime(state.settings.targetWake, "wake");
+    const band = (target, className) => {
+      const start = clamp(target - threshold, range.min, range.max);
+      const end = clamp(target + threshold, range.min, range.max);
+      return `<rect class="target-band ${className}" x="${left}" y="${y(start)}" width="${width}" height="${Math.max(2, y(end) - y(start))}"></rect>`;
+    };
+    return `${band(targetBed, "bed")}${band(targetWake, "wake")}`;
+  }
+
+  function makeTimeTicks(min, max, step) {
+    const ticks = [];
+    const first = Math.ceil(min / step) * step;
+    for (let tick = first; tick <= max; tick += step) ticks.push(tick);
+    if (!ticks.includes(min)) ticks.unshift(min);
+    if (!ticks.includes(max)) ticks.push(max);
+    return ticks;
+  }
+
+  function renderDayDetail(model) {
+    const item = model.selectedItem;
+    if (!item) {
+      els.dayDetail.hidden = false;
+      els.dayDetail.classList.add("is-empty");
+      els.dayDetail.innerHTML = `
+        <div>
+          <p class="detail-eyebrow">日期详情</p>
+          <h3>选择任意日期</h3>
+          <p>点击月度趋势中的一晚，查看准确时间、影响因素与备注。</p>
+        </div>
       `;
       return;
     }
 
-    els.rangeLabel.textContent =
-      items.length === 1 ? formatDate(items[0].date) : `${formatDate(items[0].date)} - ${formatDate(items.at(-1).date)}`;
-
-    const x = (index) => {
-      if (items.length === 1) return margin.left + plotWidth / 2;
-      return margin.left + (index / (items.length - 1)) * plotWidth;
-    };
-    const y = (minutes) => margin.top + ((minutes - minY) / (maxY - minY)) * plotHeight;
-    const sleepPath = makePath(items.map((item, index) => [x(index), y(item.bedNorm)]));
-    const wakePath = makePath(items.map((item, index) => [x(index), y(item.wakeNorm)]));
-    const targetBedY = y(normalizeNightTime(state.settings.targetBed, "bed"));
-    const targetWakeY = y(normalizeNightTime(state.settings.targetWake, "wake"));
-    const dateStep = Math.max(1, Math.ceil(items.length / 7));
-
-    const grid = yTicks
-      .map(
-        (tick) => `
-          <line class="grid-line" x1="${margin.left}" y1="${y(tick)}" x2="${width - margin.right}" y2="${y(tick)}"></line>
-          <text class="axis-label" x="${margin.left - 12}" y="${y(tick) + 4}" text-anchor="end">${formatAxisTime(tick)}</text>
-        `,
-      )
-      .join("");
-
-    const dateLabels = items
-      .map((item, index) => {
-        if (index !== 0 && index !== items.length - 1 && index % dateStep !== 0) return "";
-        return `<text class="date-label" x="${x(index)}" y="${height - 20}" text-anchor="middle">${shortDate(item.date)}</text>`;
-      })
-      .join("");
-
-    const anomalyItems = items
-      .map((item, index) => ({ item, index }))
-      .filter(({ item }) => item.targetReasons.length);
-    anomalyItems.forEach(({ item }, index) => {
-      item.eventNumber = index + 1;
-      item.eventSummary = summarizeEventLabel(item);
-    });
-
-    const sleepPoints = items
-      .map((item, index) => pointMarkup(item, index, x(index), y(item.bedNorm), "sleep"))
-      .join("");
-    const wakePoints = items
-      .map((item, index) => pointMarkup(item, index, x(index), y(item.wakeNorm), "wake"))
-      .join("");
-    const timeLabels = items
-      .map((item, index) => {
-        if (items.length > 10 && !item.targetReasons.length) return "";
-        const labelX = x(index);
-        return `
-          <text class="time-label sleep-label" x="${labelX}" y="${y(item.bedNorm) - 12}" text-anchor="middle">${item.bedTime}</text>
-          <text class="time-label wake-label" x="${labelX}" y="${y(item.wakeNorm) + 20}" text-anchor="middle">${item.wakeTime}</text>
-        `;
-      })
-      .join("");
-    const eventCallouts = anomalyItems
-      .map(({ item, index }) => {
-        const anchorX = x(index);
-        const anchorY = Math.min(y(item.bedNorm), y(item.wakeNorm));
-        return eventCalloutMarkup(item, index, anchorX, Math.max(margin.top + 2, anchorY - 42), anchorY - 9, width, margin);
-      })
-      .join("");
-
-    els.chart.innerHTML = `
-      ${grid}
-      <line class="target-line" x1="${margin.left}" y1="${targetBedY}" x2="${width - margin.right}" y2="${targetBedY}"></line>
-      <line class="target-line" x1="${margin.left}" y1="${targetWakeY}" x2="${width - margin.right}" y2="${targetWakeY}"></line>
-      <path class="trend-line sleep-line" d="${sleepPath}"></path>
-      <path class="trend-line wake-line" d="${wakePath}"></path>
-      ${sleepPoints}
-      ${wakePoints}
-      ${timeLabels}
-      ${eventCallouts}
-      ${dateLabels}
-    `;
-
-    els.chart.querySelectorAll(".point").forEach((point) => {
-      point.addEventListener("mouseenter", showPointTooltip);
-      point.addEventListener("mousemove", moveTooltip);
-      point.addEventListener("mouseleave", hideTooltip);
-      point.addEventListener("click", editChartEntry);
-    });
-    els.chart.querySelectorAll(".event-callout").forEach((callout) => {
-      callout.addEventListener("mouseenter", showEventTooltip);
-      callout.addEventListener("mousemove", moveTooltip);
-      callout.addEventListener("mouseleave", hideTooltip);
-      callout.addEventListener("click", editChartEntry);
-    });
-  }
-
-  function pointMarkup(item, index, cx, cy, kind) {
-    const isAlert = item.targetReasons.length;
-    const className = `point ${kind}${isAlert ? " alert" : ""}`;
-    const marker = isAlert
-      ? `
-        <text
-          class="point-number"
-          x="${cx}"
-          y="${cy + 4}"
-          text-anchor="middle"
-          data-index="${index}"
-          data-kind="${kind}"
-        >${item.eventNumber}</text>
-      `
+    const index = model.items.findIndex((candidate) => candidate.date === item.date);
+    const previous = model.items[index - 1];
+    const next = model.items[index + 1];
+    const reasons = item.targetReasons.length
+      ? item.targetReasons.map((reason) => `<span class="reason-pill">${escapeHtml(reason)}</span>`).join("")
+      : '<span class="reason-pill stable">目标范围内</span>';
+    const tagsMarkup = item.tags.length
+      ? `<div class="detail-tags">${item.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>`
       : "";
-    return `
-      <circle
-        class="${className}"
-        cx="${cx}"
-        cy="${cy}"
-        r="${isAlert ? 6 : 5}"
-        data-index="${index}"
-        data-kind="${kind}"
-        tabindex="0"
-      ></circle>
-      ${marker}
+
+    els.dayDetail.hidden = false;
+    els.dayDetail.classList.remove("is-empty");
+    els.dayDetail.innerHTML = `
+      <header class="night-detail-header">
+        <div>
+          <p class="detail-eyebrow">已选日期</p>
+          <h3>${formatDate(item.date)}</h3>
+        </div>
+        <button class="detail-close" type="button" data-detail-action="close" aria-label="关闭日期详情">
+          <i data-lucide="x"></i>
+        </button>
+      </header>
+      <div class="night-detail-stats">
+        <div><span>入睡</span><strong class="sleep-text">${item.bedTime}</strong></div>
+        <div><span>起床</span><strong class="wake-text">${item.wakeTime}</strong></div>
+        <div><span>睡眠时长</span><strong>${formatDurationLong(item.duration)}</strong></div>
+      </div>
+      <div class="detail-section">
+        <span class="detail-label">状态</span>
+        <div class="reason-list">${reasons}</div>
+      </div>
+      ${tagsMarkup}
+      ${item.note ? `<div class="detail-section"><span class="detail-label">备注</span><p class="detail-note">${escapeHtml(item.note)}</p></div>` : ""}
+      <button class="detail-edit" type="button" data-detail-action="edit">
+        <i data-lucide="pencil"></i>
+        编辑这晚记录
+      </button>
+      <div class="detail-pager">
+        <button type="button" data-detail-action="previous" ${previous ? "" : "disabled"}>
+          <i data-lucide="chevron-left"></i>
+          上一晚
+        </button>
+        <span>${index + 1} / ${model.items.length}</span>
+        <button type="button" data-detail-action="next" ${next ? "" : "disabled"}>
+          下一晚
+          <i data-lucide="chevron-right"></i>
+        </button>
+      </div>
     `;
   }
 
-  function eventCalloutMarkup(item, index, anchorX, labelY, connectorY, width, margin) {
-    const text = item.eventSummary ? `${item.eventNumber} ${item.eventSummary}` : String(item.eventNumber);
-    const labelWidth = Math.min(118, Math.max(30, text.length * 13 + 20));
-    const labelX = clamp(anchorX - labelWidth / 2, margin.left, width - margin.right - labelWidth);
-    const textX = labelX + 10;
-    const labelHeight = 26;
-    return `
-      <g class="event-callout" data-index="${index}" tabindex="0">
-        <line class="event-connector" x1="${anchorX}" y1="${labelY + labelHeight}" x2="${anchorX}" y2="${connectorY}"></line>
-        <rect class="event-pill" x="${labelX}" y="${labelY}" width="${labelWidth}" height="${labelHeight}" rx="13"></rect>
-        <text class="event-text" x="${textX}" y="${labelY + 17}">${escapeSvgText(text)}</text>
-      </g>
-    `;
+  function handleTrendClick(event) {
+    const day = event.target.closest("[data-date]");
+    if (day) {
+      selectTrendDate(day.dataset.date);
+      return;
+    }
+    const monthHit = event.target.closest(".month-hit");
+    if (monthHit) selectNearestMonthDate(event, monthHit.dataset.month);
   }
 
-  function showPointTooltip(event) {
-    const point = event.currentTarget;
-    const analysis = analyzeEntries();
-    const item = analysis.items[Number(point.dataset.index)];
-    const kind = point.dataset.kind === "sleep" ? "入睡" : "起床";
-    const time = point.dataset.kind === "sleep" ? item.bedTime : item.wakeTime;
-    const reasons = item.targetReasons.length ? item.targetReasons.join("、") : "目标范围内";
-    els.tooltip.innerHTML = `
-      <strong>${formatDate(item.date)} ${kind} ${time}</strong><br>
-      睡眠 ${formatDuration(item.duration)}<br>
-      ${escapeHtml(reasons)}
-      ${item.tags.length ? `<br>事件：${escapeHtml(item.tags.join("、"))}` : ""}
-      ${item.note ? `<br>${escapeHtml(item.note)}` : ""}
-      <br><span class="tooltip-hint">点击可编辑这一天</span>
-    `;
-    els.tooltip.hidden = false;
-    moveTooltip(event);
+  function handleTrendKeydown(event) {
+    const day = event.target.closest("[data-date]");
+    const monthHit = event.target.closest(".month-hit");
+    if (day && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      selectTrendDate(day.dataset.date, { focus: true });
+      return;
+    }
+    if ((day || monthHit) && (event.key === "ArrowLeft" || event.key === "ArrowRight")) {
+      event.preventDefault();
+      moveTrendSelection(event.key === "ArrowLeft" ? -1 : 1, monthHit && monthHit.dataset.month);
+      return;
+    }
+    if ((day || monthHit) && (event.key === "Home" || event.key === "End")) {
+      event.preventDefault();
+      const monthKey = monthHit ? monthHit.dataset.month : day.dataset.date.slice(0, 7);
+      selectMonthEdge(monthKey, event.key === "Home" ? "first" : "last");
+      return;
+    }
+    if (monthHit && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      const month = trendUi.model.months.find((candidate) => candidate.key === monthHit.dataset.month);
+      const item = month && month.days.map((candidate) => candidate.item).filter(Boolean)[0];
+      if (item) selectTrendDate(item.date, { focus: true });
+    }
   }
 
-  function showEventTooltip(event) {
-    const analysis = analyzeEntries();
-    const item = analysis.items[Number(event.currentTarget.dataset.index)];
-    const reasons = item.targetReasons.length ? item.targetReasons.join("、") : "目标范围内";
-    els.tooltip.innerHTML = `
-      <strong>${formatDate(item.date)} · 异常 ${item.eventNumber || ""}</strong><br>
-      入睡 ${item.bedTime} · 起床 ${item.wakeTime} · ${formatDuration(item.duration)}<br>
-      ${escapeHtml(reasons)}
-      ${item.tags.length ? `<br>事件：${escapeHtml(item.tags.join("、"))}` : ""}
-      ${item.note ? `<br>${escapeHtml(item.note)}` : ""}
-      <br><span class="tooltip-hint">点击可编辑这一天</span>
-    `;
-    els.tooltip.hidden = false;
-    moveTooltip(event);
+  function selectNearestMonthDate(event, monthKey) {
+    const model = trendUi.model;
+    const month = model.months.find((candidate) => candidate.key === monthKey);
+    const svg = event.target.closest("svg");
+    if (!month || !svg) return;
+    const rect = svg.getBoundingClientRect();
+    const viewBox = svg.viewBox.baseVal;
+    const frame = getMonthChartFrame();
+    const left = frame.margin.left;
+    const right = frame.margin.right;
+    const plotWidth = viewBox.width - left - right;
+    const svgX = ((event.clientX - rect.left) / rect.width) * viewBox.width;
+    const targetIndex = Math.round(clamp((svgX - left) / plotWidth, 0, 1) * Math.max(0, month.days.length - 1));
+    let distance = 0;
+    while (distance < month.days.length) {
+      const leftDay = month.days[targetIndex - distance];
+      const rightDay = month.days[targetIndex + distance];
+      const item = (leftDay && leftDay.item) || (rightDay && rightDay.item);
+      if (item) {
+        selectTrendDate(item.date);
+        return;
+      }
+      distance += 1;
+    }
   }
 
-  function editChartEntry(event) {
-    const analysis = analyzeEntries();
-    const item = analysis.items[Number(event.currentTarget.dataset.index)];
-    const entry = state.entries.find((record) => record.id === item.id);
-    if (!entry) return;
-    hideTooltip();
-    editEntry(entry);
+  function selectTrendDate(date, options = {}) {
+    trendUi.selectedDate = date;
+    renderChart();
+    if (options.focus) {
+      requestAnimationFrame(() => {
+        const target = els.monthCharts.querySelector(`[data-date="${date}"]`);
+        target && target.focus();
+      });
+    }
   }
 
-  function moveTooltip(event) {
-    const wrap = els.chart.parentElement.getBoundingClientRect();
-    const left = Math.min(event.clientX - wrap.left + 14, wrap.width - 284);
-    const top = Math.max(10, event.clientY - wrap.top - 24);
-    els.tooltip.style.left = `${Math.max(10, left)}px`;
-    els.tooltip.style.top = `${top}px`;
+  function moveTrendSelection(delta, monthKey = "") {
+    const items = monthKey
+      ? trendUi.model.items.filter((item) => item.date.startsWith(monthKey))
+      : trendUi.model.items;
+    if (!items.length) return;
+    let index = items.findIndex((item) => item.date === trendUi.selectedDate);
+    if (index < 0) index = delta > 0 ? -1 : items.length;
+    const next = items[clamp(index + delta, 0, items.length - 1)];
+    if (next) selectTrendDate(next.date, { focus: true });
   }
 
-  function hideTooltip() {
-    els.tooltip.hidden = true;
+  function selectMonthEdge(monthKey, edge) {
+    const items = trendUi.model.items.filter((item) => item.date.startsWith(monthKey));
+    const item = edge === "last" ? items.at(-1) : items[0];
+    if (item) selectTrendDate(item.date, { focus: true });
+  }
+
+  function clearTrendSelection() {
+    const restoreDate = trendUi.selectedDate;
+    trendUi.selectedDate = "";
+    renderChart();
+    if (restoreDate) {
+      requestAnimationFrame(() => {
+        const target = els.monthCharts.querySelector(`[data-date="${restoreDate}"]`);
+        target && target.focus();
+      });
+    }
+  }
+
+  function handleDetailAction(event) {
+    const button = event.target.closest("[data-detail-action]");
+    if (!button) return;
+    const action = button.dataset.detailAction;
+    if (action === "close") clearTrendSelection();
+    if (action === "previous") moveTrendSelection(-1);
+    if (action === "next") moveTrendSelection(1);
+    if (action === "edit" && trendUi.model.selectedItem) editEntry(trendUi.model.selectedItem);
+  }
+
+  function handleMonthJump(event) {
+    const button = event.target.closest("[data-month-target]");
+    if (!button) return;
+    const target = document.querySelector(`#month-${button.dataset.monthTarget}`);
+    target && target.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
+  }
+
+  function toggleMedian() {
+    trendUi.showMedian = els.medianToggle.checked;
+    localStorage.setItem(CHART_PREFS_KEY, JSON.stringify({ showMedian: trendUi.showMedian }));
+    renderChart();
+  }
+
+  function trendDayAriaLabel(item) {
+    const stateLabel = item.targetReasons.length ? `，偏离：${item.targetReasons.join("、")}` : "，目标范围内";
+    return `${formatDate(item.date)}，入睡 ${item.bedTime}，起床 ${item.wakeTime}，睡眠 ${formatDurationLong(item.duration)}${stateLabel}`;
+  }
+
+  function formatDurationLong(minutes) {
+    const hours = Math.floor(minutes / 60);
+    const mins = Math.round(minutes % 60);
+    return mins ? `${hours}小时${mins}分钟` : `${hours}小时`;
+  }
+
+  function prefersReducedMotion() {
+    return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   }
 
   function renderAnomalies(analysis) {
@@ -534,14 +847,17 @@
     if (!entry || !confirm(`删除 ${formatDate(entry.date)} 的记录？`)) return;
     state.entries = state.entries.filter((item) => item.id !== id);
     persistEntries();
+    queueCloudDelete(id);
     render();
   }
 
   function clearAll() {
     if (!state.entries.length) return;
     if (!confirm("清空所有记录？")) return;
+    const deletedIds = state.entries.map((entry) => entry.id);
     state.entries = [];
     persistEntries();
+    queueCloudDeletes(deletedIds);
     resetEntryForm();
     render();
   }
@@ -641,71 +957,132 @@
     renderCloudUi();
   }
 
-  async function loadCloudData() {
-    if (!syncState.ready || syncState.loading) return;
+  async function refreshCloudData() {
+    if (!syncState.ready || !syncState.firebase) return;
+    clearTimeout(syncState.pendingTimer);
+    const flushed = await flushCloudQueue();
+    await loadCloudData({ flushPending: false });
+    if (!flushed && hasPendingCloudOperations()) {
+      setCloudUi("error", "已重新读取云端，但待处理更改尚未同步。");
+    }
+  }
+
+  async function loadCloudData(options = {}) {
+    if (!syncState.ready || syncState.loading) return false;
     syncState.loading = true;
     setCloudUi("checking", "正在读取云端记录...");
+    let shouldFlush = false;
     try {
       const { collection, doc, getDoc, getDocs } = syncState.firebase.firestore;
       const settingsRef = doc(syncState.db, "users", syncState.user.uid, "profile", "settings");
       const entriesRef = collection(syncState.db, "users", syncState.user.uid, "entries");
       const [settingsSnapshot, entriesSnapshot] = await Promise.all([getDoc(settingsRef), getDocs(entriesRef)]);
-      const cloudSettings = settingsSnapshot.exists() ? settingsSnapshot.data() : null;
-      const cloudEntries = entriesSnapshot.docs.map((entryDoc) => ({ id: entryDoc.id, ...entryDoc.data() }));
+      const cloudSettings = settingsSnapshot.exists()
+        ? sanitizeSettings(settingsSnapshot.data(), { migrateLegacyThreshold: true })
+        : { ...defaultSettings };
+      const cloudEntries = entriesSnapshot.docs
+        .map((entryDoc) => ({ ...entryDoc.data(), id: entryDoc.id }))
+        .filter(isValidEntry)
+        .map(normalizeEntryForSave);
+      const overlay = applyPendingCloudOperations(cloudEntries, cloudSettings);
 
-      if (cloudSettings) {
-        state.settings = sanitizeSettings(cloudSettings, { migrateLegacyThreshold: true });
-      }
-      state.entries = mergeEntries(state.entries, cloudEntries);
+      state.settings = overlay.settings;
+      state.entries = overlay.entries;
       sortEntries();
       persistLocalOnly();
       hydrateForms();
       render();
-      syncState.loading = false;
-      await syncCloudFromLocal();
-      setCloudUi("synced", `已同步：${syncState.user.displayName || syncState.user.email || "Google 账号"}`);
+      syncState.lastSyncAt = new Date().toISOString();
+      shouldFlush = hasPendingCloudOperations();
+      setCloudUi("synced", `已读取云端：${cloudUserLabel(syncState.user)}`);
+      return true;
     } catch (error) {
       console.error(error);
       setCloudUi("error", "读取云端记录失败，请检查 Firestore 是否已开启并配置规则。");
+      return false;
     } finally {
       syncState.loading = false;
+      if (shouldFlush && options.flushPending !== false) {
+        await flushCloudQueue();
+      }
     }
   }
 
-  async function syncCloudFromLocal() {
-    if (!syncState.ready || !syncState.firebase || syncState.loading) return;
-    clearTimeout(syncState.pendingTimer);
-    setCloudUi("checking", "正在同步到云端...");
+  async function flushCloudQueue() {
+    if (!syncState.ready || !syncState.firebase) {
+      updateTrendSourceStatus("local");
+      return false;
+    }
+    if (syncState.flushPromise) return syncState.flushPromise;
+    if (syncState.loading) {
+      scheduleCloudSave();
+      return false;
+    }
+
+    const promise = performCloudQueueFlush();
+    syncState.flushPromise = promise;
     try {
-      const { collection, doc, getDocs, setDoc, writeBatch } = syncState.firebase.firestore;
+      return await promise;
+    } finally {
+      if (syncState.flushPromise === promise) syncState.flushPromise = null;
+    }
+  }
+
+  async function performCloudQueueFlush() {
+    clearTimeout(syncState.pendingTimer);
+    const snapshot = cloudQueue.operations.slice();
+    if (!snapshot.length) {
+      updateTrendSourceStatus("synced");
+      return true;
+    }
+
+    const compacted = compactCloudOperations(snapshot);
+    const writes = [...compacted.entryOperations];
+    if (compacted.settingsOperation) writes.push(compacted.settingsOperation);
+    setCloudUi("checking", `正在同步 ${writes.length} 项更改...`);
+
+    try {
+      const { collection, doc, writeBatch } = syncState.firebase.firestore;
       const settingsRef = doc(syncState.db, "users", syncState.user.uid, "profile", "settings");
       const entriesRef = collection(syncState.db, "users", syncState.user.uid, "entries");
-      const snapshot = await getDocs(entriesRef);
-      const batch = writeBatch(syncState.db);
-      const localIds = new Set(state.entries.map((entry) => entry.id));
+      const batchSize = 450;
 
-      snapshot.docs.forEach((entryDoc) => {
-        if (!localIds.has(entryDoc.id)) {
-          batch.delete(entryDoc.ref);
-        }
-      });
+      for (let offset = 0; offset < writes.length; offset += batchSize) {
+        const batch = writeBatch(syncState.db);
+        writes.slice(offset, offset + batchSize).forEach((operation) => {
+          if (operation.type === "upsert") {
+            batch.set(doc(entriesRef, operation.entry.id), operation.entry, { merge: true });
+          }
+          if (operation.type === "delete") {
+            batch.delete(doc(entriesRef, operation.id));
+          }
+          if (operation.type === "settings") {
+            batch.set(settingsRef, operation.settings, { merge: true });
+          }
+        });
+        await batch.commit();
+      }
 
-      state.entries.forEach((entry) => {
-        batch.set(doc(entriesRef, entry.id), normalizeEntryForSave(entry), { merge: true });
-      });
-
-      await Promise.all([setDoc(settingsRef, sanitizeSettings(state.settings), { merge: true }), batch.commit()]);
+      cloudQueue.operations.splice(0, snapshot.length);
+      persistCloudQueue();
+      syncState.lastSyncAt = new Date().toISOString();
       setCloudUi("synced", "云端已同步。");
+      if (hasPendingCloudOperations()) scheduleCloudSave();
+      return true;
     } catch (error) {
       console.error(error);
       setCloudUi("error", "同步失败，请稍后重试。");
+      return false;
     }
   }
 
-  function scheduleCloudSave() {
-    if (!syncState.ready) return;
+  function scheduleCloudSave(delay = 650) {
     clearTimeout(syncState.pendingTimer);
-    syncState.pendingTimer = setTimeout(syncCloudFromLocal, 650);
+    if (!syncState.ready || !syncState.firebase) {
+      updateTrendSourceStatus("local");
+      return;
+    }
+    syncState.pendingTimer = setTimeout(() => flushCloudQueue(), delay);
     setCloudUi("checking", "等待同步...");
   }
 
@@ -722,7 +1099,7 @@
       els.syncNowBtn.hidden = true;
       return;
     }
-    setCloudUi("synced", `已登录：${syncState.user.displayName || syncState.user.email || "Google 账号"}`);
+    setCloudUi("checking", `已登录：${cloudUserLabel(syncState.user)}，正在读取云端...`);
     els.signInBtn.hidden = true;
     els.googleButtonHost.hidden = true;
     els.signOutBtn.hidden = false;
@@ -739,6 +1116,7 @@
     els.cloudBadge.textContent = badgeText[status] || "本地";
     els.cloudBadge.dataset.status = status;
     els.cloudStatus.textContent = message;
+    updateTrendSourceStatus(status);
     if (!syncState.configured) {
       els.signInBtn.hidden = true;
       els.googleButtonHost.hidden = true;
@@ -753,6 +1131,38 @@
       els.syncNowBtn.hidden = !syncState.ready;
     }
     window.lucide && window.lucide.createIcons();
+  }
+
+  function updateTrendSourceStatus(status = "local") {
+    if (!els.trendSourceStatus) return;
+    const pendingCount = pendingCloudOperationCount();
+    const syncedAt = syncState.lastSyncAt
+      ? new Date(syncState.lastSyncAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+      : "";
+    const icon = {
+      checking: "refresh-cw",
+      error: "cloud-off",
+      local: "database",
+      synced: "cloud-check",
+    }[status] || "database";
+    let label = "本地缓存";
+
+    if (status === "checking") label = pendingCount ? `正在同步 · ${pendingCount} 项待处理` : "正在读取云端";
+    if (status === "error") label = pendingCount ? `同步异常 · ${pendingCount} 项待处理` : "云端读取异常";
+    if (status === "local" && pendingCount) label = `本地缓存 · ${pendingCount} 项待同步`;
+    if (status === "synced") {
+      label = pendingCount ? `云端数据 · ${pendingCount} 项待同步` : `云端数据${syncedAt ? ` · ${syncedAt}` : ""}`;
+    }
+
+    els.trendSourceStatus.dataset.status = status;
+    els.trendSourceStatus.innerHTML = `<i data-lucide="${icon}"></i><span>${escapeHtml(label)}</span>`;
+    window.lucide && window.lucide.createIcons();
+  }
+
+  function cloudUserLabel(user) {
+    if (!user) return "当前账号";
+    if (user.isAnonymous) return "匿名账号";
+    return user.displayName || user.email || "Google 账号";
   }
 
   function authErrorMessage(error) {
@@ -785,32 +1195,22 @@
   }
 
   function analyzeEntries() {
-    const threshold = state.settings.driftThreshold;
-    const targetBed = normalizeNightTime(state.settings.targetBed, "bed");
-    const targetWake = normalizeNightTime(state.settings.targetWake, "wake");
+    const normalizedEntries = trendCore.dedupeEntriesByDate(state.entries);
+    const analysis = trendCore.analyzeEntries(normalizedEntries, state.settings);
+    return {
+      items: analysis.items.map((item) => ({
+        ...item,
+        targetReasonDetails: item.targetReasons,
+        targetReasons: item.targetReasons.map(formatTargetReason),
+      })),
+    };
+  }
 
-    const items = state.entries.map((entry, index, entries) => {
-      const bedNorm = normalizeNightTime(entry.bedTime, "bed");
-      const wakeNorm = normalizeNightTime(entry.wakeTime, "wake");
-      const duration = wakeNorm >= bedNorm ? wakeNorm - bedNorm : wakeNorm + 24 * 60 - bedNorm;
-      const targetReasons = [];
-
-      if (bedNorm - targetBed > threshold) targetReasons.push(`晚睡 ${formatDelta(bedNorm - targetBed)}`);
-      if (wakeNorm - targetWake > threshold) targetReasons.push(`晚起 ${formatDelta(wakeNorm - targetWake)}`);
-      if (duration < 6 * 60) targetReasons.push("睡眠不足 6 小时");
-
-      return {
-        ...entry,
-        tags: entry.tags || [],
-        bedNorm,
-        wakeNorm,
-        duration,
-        targetReasons,
-        stable: targetReasons.length === 0,
-      };
-    });
-
-    return { items };
+  function formatTargetReason(reason) {
+    if (reason.type === "late-bed") return `晚睡 ${formatDelta(reason.minutes)}`;
+    if (reason.type === "late-wake") return `晚起 ${formatDelta(reason.minutes)}`;
+    if (reason.type === "short-sleep") return "睡眠不足 6 小时";
+    return "偏离目标";
   }
 
   function countStableDays(items) {
@@ -868,11 +1268,18 @@
       try {
         const payload = JSON.parse(reader.result);
         if (!Array.isArray(payload.entries)) throw new Error("missing entries");
-        state.entries = payload.entries.filter(isValidEntry);
-        state.settings = sanitizeSettings(payload.settings || {});
-        sortEntries();
+        const previousByDate = new Map(state.entries.map((entry) => [entry.date, entry]));
+        const importedEntries = trendCore
+          .dedupeEntriesByDate(payload.entries.filter(isValidEntry).map(normalizeEntryForSave));
+        const importedWinners = importedEntries.filter((entry) => {
+          const current = previousByDate.get(entry.date);
+          return !current || (Date.parse(entry.updatedAt || "") || 0) >= (Date.parse(current.updatedAt || "") || 0);
+        });
+        state.entries = mergeEntries(state.entries, importedEntries);
+        state.settings = sanitizeSettings(payload.settings || state.settings);
         persistEntries();
         persistSettings();
+        queueCloudImport(importedWinners, state.settings);
         hydrateForms();
         render();
       } catch (error) {
@@ -887,7 +1294,7 @@
   function loadEntries() {
     try {
       const entries = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
-      return Array.isArray(entries) ? entries.filter(isValidEntry).sort(byDateValue) : [];
+      return Array.isArray(entries) ? trendCore.dedupeEntriesByDate(entries.filter(isValidEntry)) : [];
     } catch {
       return [];
     }
@@ -907,18 +1314,159 @@
     }
   }
 
+  function loadChartPreferences() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(CHART_PREFS_KEY) || "{}");
+      return { showMedian: stored.showMedian !== false };
+    } catch {
+      return { showMedian: true };
+    }
+  }
+
+  function loadCloudQueue() {
+    try {
+      const stored = JSON.parse(localStorage.getItem(CLOUD_QUEUE_KEY) || "{}");
+      const candidates = Array.isArray(stored) ? stored : Array.isArray(stored.operations) ? stored.operations : [];
+
+      if (!candidates.length && stored && typeof stored === "object") {
+        const legacyUpserts = Array.isArray(stored.upserts)
+          ? stored.upserts
+          : stored.upserts && typeof stored.upserts === "object"
+            ? Object.values(stored.upserts)
+            : [];
+        legacyUpserts.forEach((entry) => candidates.push({ type: "upsert", entry }));
+        const legacyDeletes = Array.isArray(stored.deletes)
+          ? stored.deletes
+          : stored.deletes && typeof stored.deletes === "object"
+            ? Object.keys(stored.deletes)
+            : [];
+        legacyDeletes.forEach((id) => candidates.push({ type: "delete", id }));
+        if (stored.settings) candidates.push({ type: "settings", settings: stored.settings });
+      }
+
+      return {
+        version: 1,
+        operations: candidates.map(sanitizeCloudOperation).filter(Boolean),
+      };
+    } catch {
+      return { version: 1, operations: [] };
+    }
+  }
+
+  function sanitizeCloudOperation(operation) {
+    if (!operation || typeof operation !== "object") return null;
+    if (operation.type === "upsert" && isValidEntry(operation.entry)) {
+      return { type: "upsert", entry: normalizeEntryForSave(operation.entry) };
+    }
+    if (operation.type === "delete" && typeof operation.id === "string" && operation.id) {
+      return { type: "delete", id: operation.id };
+    }
+    if (operation.type === "settings" && operation.settings && typeof operation.settings === "object") {
+      return { type: "settings", settings: sanitizeSettings(operation.settings) };
+    }
+    return null;
+  }
+
+  function persistCloudQueue() {
+    try {
+      localStorage.setItem(CLOUD_QUEUE_KEY, JSON.stringify(cloudQueue));
+    } catch (error) {
+      console.warn("无法保存云同步队列。", error);
+    }
+  }
+
+  function enqueueCloudOperations(operations) {
+    const validOperations = operations.map(sanitizeCloudOperation).filter(Boolean);
+    if (!validOperations.length) return;
+    cloudQueue.operations.push(...validOperations);
+    persistCloudQueue();
+    scheduleCloudSave();
+  }
+
+  function queueCloudUpsert(entry) {
+    enqueueCloudOperations([{ type: "upsert", entry }]);
+  }
+
+  function queueCloudDelete(id) {
+    enqueueCloudOperations([{ type: "delete", id }]);
+  }
+
+  function queueCloudDeletes(ids) {
+    enqueueCloudOperations(ids.map((id) => ({ type: "delete", id })));
+  }
+
+  function queueCloudSettings(settings) {
+    enqueueCloudOperations([{ type: "settings", settings }]);
+  }
+
+  function queueCloudImport(importedEntries, settings) {
+    const operations = [];
+    importedEntries.forEach((entry) => operations.push({ type: "upsert", entry }));
+    operations.push({ type: "settings", settings });
+    enqueueCloudOperations(operations);
+  }
+
+  function compactCloudOperations(operations = cloudQueue.operations) {
+    const entryById = new Map();
+    let settingsOperation = null;
+    operations.map(sanitizeCloudOperation).filter(Boolean).forEach((operation) => {
+      if (operation.type === "upsert") entryById.set(operation.entry.id, operation);
+      if (operation.type === "delete") entryById.set(operation.id, operation);
+      if (operation.type === "settings") settingsOperation = operation;
+    });
+    return {
+      entryOperations: Array.from(entryById.values()),
+      settingsOperation,
+    };
+  }
+
+  function hasPendingCloudOperations() {
+    return cloudQueue.operations.length > 0;
+  }
+
+  function pendingCloudOperationCount() {
+    const compacted = compactCloudOperations();
+    return compacted.entryOperations.length + (compacted.settingsOperation ? 1 : 0);
+  }
+
+  function applyPendingCloudOperations(cloudEntries, cloudSettings) {
+    const baseEntries = mergeEntries([], cloudEntries);
+    const entriesById = new Map(baseEntries.map((entry) => [entry.id, normalizeEntryForSave(entry)]));
+    let settings = sanitizeSettings(cloudSettings, { migrateLegacyThreshold: true });
+
+    cloudQueue.operations.map(sanitizeCloudOperation).filter(Boolean).forEach((operation) => {
+      if (operation.type === "delete") entriesById.delete(operation.id);
+      if (operation.type === "upsert") {
+        entriesById.forEach((entry, id) => {
+          if (id !== operation.entry.id && entry.date === operation.entry.date) entriesById.delete(id);
+        });
+        entriesById.set(operation.entry.id, operation.entry);
+      }
+      if (operation.type === "settings") settings = operation.settings;
+    });
+
+    return {
+      entries: Array.from(entriesById.values()).sort(byDateValue),
+      settings,
+    };
+  }
+
   function isValidEntry(entry) {
-    return entry && entry.id && isDate(entry.date) && isTime(entry.bedTime) && isTime(entry.wakeTime);
+    return (
+      entry &&
+      entry.id &&
+      trendCore.isValidDateString(entry.date) &&
+      trendCore.isValidTimeString(entry.bedTime) &&
+      trendCore.isValidTimeString(entry.wakeTime)
+    );
   }
 
   function persistEntries() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state.entries));
-    scheduleCloudSave();
   }
 
   function persistSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
-    scheduleCloudSave();
   }
 
   function persistLocalOnly() {
@@ -927,22 +1475,19 @@
   }
 
   function mergeEntries(localEntries, cloudEntries) {
-    const byDate = new Map();
-    [...localEntries, ...cloudEntries].filter(isValidEntry).forEach((entry) => {
-      const normalized = normalizeEntryForSave(entry);
-      const current = byDate.get(normalized.date);
-      if (!current || new Date(normalized.updatedAt || 0) >= new Date(current.updatedAt || 0)) {
-        byDate.set(normalized.date, normalized);
-      }
-    });
-    return Array.from(byDate.values()).sort(byDateValue);
+    return trendCore.dedupeEntriesByDate(
+      [...localEntries, ...cloudEntries].filter(isValidEntry).map(normalizeEntryForSave),
+    );
   }
 
   function sanitizeSettings(settings, options = {}) {
-    const threshold = Number(settings.driftThreshold) || defaultSettings.driftThreshold;
+    const rawThreshold = Number(settings.driftThreshold);
+    const threshold = Number.isFinite(rawThreshold)
+      ? clamp(rawThreshold, 15, 120)
+      : defaultSettings.driftThreshold;
     return {
-      targetBed: isTime(settings.targetBed) ? settings.targetBed : defaultSettings.targetBed,
-      targetWake: isTime(settings.targetWake) ? settings.targetWake : defaultSettings.targetWake,
+      targetBed: trendCore.isValidTimeString(settings.targetBed) ? settings.targetBed : defaultSettings.targetBed,
+      targetWake: trendCore.isValidTimeString(settings.targetWake) ? settings.targetWake : defaultSettings.targetWake,
       driftThreshold:
         options.migrateLegacyThreshold && threshold === legacyDefaultSettings.driftThreshold
           ? defaultSettings.driftThreshold
@@ -968,44 +1513,6 @@
 
   function byDateValue(a, b) {
     return a.date.localeCompare(b.date);
-  }
-
-  function normalizeNightTime(value, kind) {
-    const minutes = timeToMinutes(value);
-    if (kind === "bed") return minutes < 12 * 60 ? minutes + 24 * 60 : minutes;
-    return minutes < 18 * 60 ? minutes + 24 * 60 : minutes;
-  }
-
-  function getChartRange(items) {
-    const values = items.flatMap((item) => [item.bedNorm, item.wakeNorm]);
-    const targetValues = [
-      normalizeNightTime(state.settings.targetBed, "bed"),
-      normalizeNightTime(state.settings.targetWake, "wake"),
-    ];
-    const defaultMin = 22 * 60;
-    const defaultMax = 33 * 60;
-    const rawMin = Math.min(defaultMin, ...values, ...targetValues);
-    const rawMax = Math.max(defaultMax, ...values, ...targetValues);
-    const min = Math.max(20 * 60, Math.floor(rawMin / 60) * 60);
-    const max = Math.min(36 * 60, Math.ceil(rawMax / 60) * 60);
-    return { min, max };
-  }
-
-  function makeHourlyTicks(min, max) {
-    const ticks = [];
-    for (let tick = min; tick <= max; tick += 60) {
-      ticks.push(tick);
-    }
-    return ticks;
-  }
-
-  function timeToMinutes(value) {
-    const [hours, minutes] = value.split(":").map(Number);
-    return hours * 60 + minutes;
-  }
-
-  function makePath(points) {
-    return points.map(([x, y], index) => `${index ? "L" : "M"} ${x.toFixed(1)} ${y.toFixed(1)}`).join(" ");
   }
 
   function average(values) {
@@ -1049,18 +1556,6 @@
     return `${year}-${month}-${day}`;
   }
 
-  function isDate(value) {
-    return /^\d{4}-\d{2}-\d{2}$/.test(value);
-  }
-
-  function isTime(value) {
-    return /^\d{2}:\d{2}$/.test(value);
-  }
-
-  function summarizeEventLabel(item) {
-    return item.tags && item.tags.length ? item.tags.join("/") : "";
-  }
-
   function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max);
   }
@@ -1070,10 +1565,6 @@
       const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" };
       return map[char];
     });
-  }
-
-  function escapeSvgText(value) {
-    return escapeHtml(value);
   }
 
   function makeId() {
