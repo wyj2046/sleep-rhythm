@@ -199,11 +199,15 @@
   }
 
   function saveSettings() {
+    const previousTargetWake = state.settings.targetWake;
     state.settings = {
       targetBed: els.targetBed.value || defaultSettings.targetBed,
       targetWake: els.targetWake.value || defaultSettings.targetWake,
       driftThreshold: Number(els.driftThreshold.value) || defaultSettings.driftThreshold,
     };
+    if (!els.editingId.value && (!els.wakeTime.value || els.wakeTime.value === previousTargetWake)) {
+      els.wakeTime.value = state.settings.targetWake;
+    }
     els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
     persistSettings();
     queueCloudSettings(state.settings);
