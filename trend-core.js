@@ -62,11 +62,87 @@
     return wake >= bed ? wake - bed : wake + 24 * 60 - bed;
   }
 
+  function isValidTargetConfig(target) {
+    const threshold = Number(target && target.driftThreshold);
+    return Boolean(
+      target &&
+        isValidTimeString(target.targetBed) &&
+        isValidTimeString(target.targetWake) &&
+        Number.isFinite(threshold) &&
+        threshold > 0,
+    );
+  }
+
+  function sanitizeTargetHistory(history) {
+    const byDate = new Map();
+    (Array.isArray(history) ? history : []).forEach((target) => {
+      if (!target || !isValidDateString(target.effectiveFrom) || !isValidTargetConfig(target)) return;
+      byDate.set(target.effectiveFrom, {
+        effectiveFrom: target.effectiveFrom,
+        targetBed: target.targetBed,
+        targetWake: target.targetWake,
+        driftThreshold: Number(target.driftThreshold),
+      });
+    });
+    return Array.from(byDate.values()).sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom));
+  }
+
+  function upsertTargetHistory(history, target, effectiveFrom) {
+    if (!isValidDateString(effectiveFrom) || !isValidTargetConfig(target)) {
+      return sanitizeTargetHistory(history);
+    }
+    return sanitizeTargetHistory([
+      ...(Array.isArray(history) ? history : []),
+      {
+        effectiveFrom,
+        targetBed: target.targetBed,
+        targetWake: target.targetWake,
+        driftThreshold: Number(target.driftThreshold),
+      },
+    ]);
+  }
+
+  function resolveTargetForDate(entry, settings) {
+    if (entry && isValidTargetConfig(entry.targetSnapshot)) {
+      return {
+        targetBed: entry.targetSnapshot.targetBed,
+        targetWake: entry.targetSnapshot.targetWake,
+        driftThreshold: Number(entry.targetSnapshot.driftThreshold),
+        effectiveFrom: isValidDateString(entry.targetSnapshot.effectiveFrom)
+          ? entry.targetSnapshot.effectiveFrom
+          : entry.date,
+        source: "snapshot",
+      };
+    }
+
+    const history = sanitizeTargetHistory(settings && settings.targetHistory);
+    if (history.length) {
+      const date = entry && isValidDateString(entry.date) ? entry.date : history.at(-1).effectiveFrom;
+      let selected = history[0];
+      history.forEach((target) => {
+        if (target.effectiveFrom <= date) selected = target;
+      });
+      return { ...selected, source: "history" };
+    }
+
+    const fallback = isValidTargetConfig(settings)
+      ? settings
+      : { targetBed: "23:00", targetWake: "07:00", driftThreshold: 30 };
+    return {
+      targetBed: fallback.targetBed,
+      targetWake: fallback.targetWake,
+      driftThreshold: Number(fallback.driftThreshold),
+      effectiveFrom: "",
+      source: "current",
+    };
+  }
+
   function analyzeEntries(entries, settings) {
-    const threshold = Number(settings.driftThreshold) || 30;
-    const targetBed = normalizeNightTime(settings.targetBed, "bed");
-    const targetWake = normalizeNightTime(settings.targetWake, "wake");
     const items = entries.map((entry) => {
+      const appliedTarget = resolveTargetForDate(entry, settings);
+      const threshold = appliedTarget.driftThreshold;
+      const targetBed = normalizeNightTime(appliedTarget.targetBed, "bed");
+      const targetWake = normalizeNightTime(appliedTarget.targetWake, "wake");
       const bedNorm = normalizeNightTime(entry.bedTime, "bed");
       const wakeNorm = normalizeNightTime(entry.wakeTime, "wake");
       const duration = wakeNorm >= bedNorm ? wakeNorm - bedNorm : wakeNorm + 24 * 60 - bedNorm;
@@ -82,6 +158,7 @@
         bedNorm,
         wakeNorm,
         duration,
+        appliedTarget,
         targetReasons,
         stable: targetReasons.length === 0,
       };
@@ -198,7 +275,12 @@
 
   function getChartRange(items, settings) {
     const values = items.flatMap((item) => [item.bedNorm, item.wakeNorm]);
-    const targetValues = [normalizeNightTime(settings.targetBed, "bed"), normalizeNightTime(settings.targetWake, "wake")];
+    const targetValues = items.length
+      ? items.flatMap((item) => {
+          const target = item.appliedTarget || resolveTargetForDate(item, settings);
+          return [normalizeNightTime(target.targetBed, "bed"), normalizeNightTime(target.targetWake, "wake")];
+        })
+      : [normalizeNightTime(settings.targetBed, "bed"), normalizeNightTime(settings.targetWake, "wake")];
     const rawMin = Math.min(22 * 60, ...values, ...targetValues);
     const rawMax = Math.max(33 * 60, ...values, ...targetValues);
     return {
@@ -214,6 +296,10 @@
     dedupeEntriesByDate,
     normalizeNightTime,
     sleepDuration,
+    isValidTargetConfig,
+    sanitizeTargetHistory,
+    upsertTargetHistory,
+    resolveTargetForDate,
     analyzeEntries,
     dateToDayNumber,
     dayNumberToDate,

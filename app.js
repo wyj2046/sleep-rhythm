@@ -4,6 +4,8 @@
   const CHART_PREFS_KEY = "sleep-rhythm.chart-prefs.v1";
   const CLOUD_QUEUE_KEY = "sleep-rhythm.cloud-queue.v1";
   const FIREBASE_SDK_VERSION = "12.13.0";
+  const TARGET_HISTORY_VERSION = 1;
+  const WAKE_620_EFFECTIVE_FROM = "2026-08-31";
   const tags = ["工作", "娱乐", "运动", "社交", "补觉", "折腾", "去医院", "生病", "失眠"];
   const legacyDefaultSettings = {
     targetBed: "23:30",
@@ -12,19 +14,33 @@
   };
   const defaultSettings = {
     targetBed: "23:00",
-    targetWake: "06:30",
+    targetWake: "06:20",
     driftThreshold: 30,
   };
+  const knownTargetHistory = [
+    { effectiveFrom: "2026-05-29", targetBed: "23:00", targetWake: "06:50", driftThreshold: 30 },
+    { effectiveFrom: "2026-07-11", targetBed: "23:00", targetWake: "06:30", driftThreshold: 30 },
+    { effectiveFrom: WAKE_620_EFFECTIVE_FROM, ...defaultSettings },
+  ];
   const trendCore = window.SleepTrendCore;
 
   if (!trendCore) {
     throw new Error("SleepTrendCore failed to load.");
   }
 
+  let pendingLocalSnapshotHistory = null;
   const state = {
     entries: loadEntries(),
     settings: loadSettings(),
   };
+  if (pendingLocalSnapshotHistory) {
+    const localSnapshotBackfill = backfillTargetSnapshots(state.entries, pendingLocalSnapshotHistory);
+    state.entries = localSnapshotBackfill.entries;
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+    if (localSnapshotBackfill.upserts.length) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.entries));
+    }
+  }
   const syncState = {
     configured: false,
     ready: false,
@@ -59,6 +75,8 @@
     targetWake: $("#targetWake"),
     driftThreshold: $("#driftThreshold"),
     driftValue: $("#driftValue"),
+    targetEffectiveStatus: $("#targetEffectiveStatus"),
+    targetHistoryList: $("#targetHistoryList"),
     statsGrid: $("#statsGrid"),
     chart: $("#trendChart"),
     rangeLabel: $("#rangeLabel"),
@@ -105,7 +123,10 @@
   function bindEvents() {
     els.form.addEventListener("submit", saveEntry);
     els.resetFormBtn.addEventListener("click", resetEntryForm);
-    els.settingsForm.addEventListener("input", saveSettings);
+    els.settingsForm.addEventListener("submit", saveSettings);
+    els.driftThreshold.addEventListener("input", () => {
+      els.driftValue.textContent = `${Number(els.driftThreshold.value) || defaultSettings.driftThreshold} 分钟`;
+    });
     els.clearAllBtn.addEventListener("click", clearAll);
     els.exportCsvBtn.addEventListener("click", exportCsv);
     els.exportJsonBtn.addEventListener("click", exportJson);
@@ -156,26 +177,52 @@
     els.targetWake.value = state.settings.targetWake;
     els.driftThreshold.value = state.settings.driftThreshold;
     els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
+    renderTargetHistory();
+  }
+
+  function renderTargetHistory() {
+    if (!els.targetEffectiveStatus || !els.targetHistoryList) return;
+    const activeTarget = trendCore.resolveTargetForDate({ date: todayString() }, state.settings);
+    els.targetEffectiveStatus.textContent = `${formatHistoryDate(activeTarget.effectiveFrom)}起生效；只影响该日及以后，之前按当时目标计算。`;
+    els.targetHistoryList.innerHTML = state.settings.targetHistory
+      .slice()
+      .reverse()
+      .map(
+        (target) => `
+          <div class="target-history-item">
+            <time datetime="${target.effectiveFrom}">${formatHistoryDate(target.effectiveFrom)}</time>
+            <strong>${target.targetBed} → ${target.targetWake}</strong>
+            <span>±${target.driftThreshold} 分钟</span>
+          </div>
+        `,
+      )
+      .join("");
   }
 
   function saveEntry(event) {
     event.preventDefault();
+    const date = els.sleepDate.value;
+    const requestedId = els.editingId.value || makeId();
+    const currentIndex = state.entries.findIndex((item) => item.id === requestedId);
+    const currentEntry = currentIndex >= 0 ? state.entries[currentIndex] : null;
+    const sameDateEntry = state.entries.find((item) => item.date === date);
+    const snapshotSource = currentEntry && currentEntry.date === date ? currentEntry : sameDateEntry;
     const entry = {
-      id: els.editingId.value || makeId(),
-      date: els.sleepDate.value,
+      id: requestedId,
+      date,
       bedTime: els.bedTime.value,
       wakeTime: els.wakeTime.value,
       tags: Array.from(document.querySelectorAll('input[name="tags"]:checked')).map((input) => input.value),
       note: els.note.value.trim(),
+      targetSnapshot: makeTargetSnapshot(date, snapshotSource && snapshotSource.targetSnapshot),
       updatedAt: new Date().toISOString(),
     };
 
     let savedEntry = entry;
     const replacedIds = [];
-    const currentIndex = state.entries.findIndex((item) => item.id === entry.id);
     if (currentIndex >= 0) {
-      const sameDateEntry = state.entries.find((item) => item.id !== entry.id && item.date === entry.date);
-      if (sameDateEntry) replacedIds.push(sameDateEntry.id);
+      const collidingEntry = state.entries.find((item) => item.id !== entry.id && item.date === entry.date);
+      if (collidingEntry) replacedIds.push(collidingEntry.id);
       state.entries[currentIndex] = entry;
       state.entries = state.entries.filter((item) => item.id === entry.id || item.date !== entry.date);
       savedEntry = entry;
@@ -198,17 +245,31 @@
     render();
   }
 
-  function saveSettings() {
+  function saveSettings(event) {
+    event.preventDefault();
+    const previousTargetBed = state.settings.targetBed;
     const previousTargetWake = state.settings.targetWake;
-    state.settings = {
+    const nextTarget = {
       targetBed: els.targetBed.value || defaultSettings.targetBed,
       targetWake: els.targetWake.value || defaultSettings.targetWake,
       driftThreshold: Number(els.driftThreshold.value) || defaultSettings.driftThreshold,
     };
+    state.settings = sanitizeSettings(
+      {
+        ...nextTarget,
+        targetHistoryVersion: TARGET_HISTORY_VERSION,
+        targetHistory: trendCore.upsertTargetHistory(state.settings.targetHistory, nextTarget, todayString()),
+      },
+      { migrateKnownHistory: false },
+    );
+    if (!els.editingId.value && (!els.bedTime.value || els.bedTime.value === previousTargetBed)) {
+      els.bedTime.value = state.settings.targetBed;
+    }
     if (!els.editingId.value && (!els.wakeTime.value || els.wakeTime.value === previousTargetWake)) {
       els.wakeTime.value = state.settings.targetWake;
     }
     els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
+    renderTargetHistory();
     persistSettings();
     queueCloudSettings(state.settings);
     render();
@@ -345,7 +406,7 @@
         : anomalyCount
           ? `节律仍在恢复，${anomalyCount} 个夜晚形成明显断点。`
           : "节律保持稳定，继续观察长期变化。";
-    els.trendDescription.textContent = `全部日期从 ${first.date} 到 ${latest.date}，共 ${model.items.length} 晚，${anomalyCount} 晚偏离当前目标。蓝线表示入睡，红线表示起床，橙色外环表示偏离。`;
+    els.trendDescription.textContent = `全部日期从 ${first.date} 到 ${latest.date}，共 ${model.items.length} 晚，${anomalyCount} 晚偏离当日目标。蓝线表示入睡，红线表示起床，橙色外环表示偏离；目标背景按生效日期分段。`;
   }
 
   function renderOverviewChart(model) {
@@ -390,7 +451,7 @@
 
     els.chart.setAttribute("viewBox", `0 0 ${width} ${height}`);
     els.chart.innerHTML = `
-      ${targetBandMarkup(y, model.range, margin.left, plotWidth)}
+      ${targetBandTimelineMarkup(model.timeline, x, y, model.range, margin.left, plotWidth)}
       <line class="overview-guide" x1="${margin.left}" y1="${y(model.range.min)}" x2="${width - margin.right}" y2="${y(model.range.min)}"></line>
       <line class="overview-guide" x1="${margin.left}" y1="${y(model.range.max)}" x2="${width - margin.right}" y2="${y(model.range.max)}"></line>
       <text class="overview-axis-label" x="${margin.left - 7}" y="${y(model.range.min) + 3}" text-anchor="end">${formatAxisTime(model.range.min)}</text>
@@ -518,7 +579,7 @@
       .join("");
 
     return `
-      ${targetBandMarkup(y, model.range, margin.left, plotWidth)}
+      ${targetBandTimelineMarkup(month.days, x, y, model.range, margin.left, plotWidth)}
       <rect
         class="month-hit"
         data-month="${month.key}"
@@ -541,16 +602,43 @@
     `;
   }
 
-  function targetBandMarkup(y, range, left, width) {
-    const threshold = state.settings.driftThreshold;
-    const targetBed = trendCore.normalizeNightTime(state.settings.targetBed, "bed");
-    const targetWake = trendCore.normalizeNightTime(state.settings.targetWake, "wake");
-    const band = (target, className) => {
+  function targetBandTimelineMarkup(days, x, y, range, left, width) {
+    if (!days.length) return "";
+    const targets = days.map((day) =>
+      day.item && day.item.appliedTarget
+        ? day.item.appliedTarget
+        : trendCore.resolveTargetForDate({ date: day.date }, state.settings),
+    );
+    const segments = [];
+    targets.forEach((target, index) => {
+      const key = [target.targetBed, target.targetWake, target.driftThreshold].join("|");
+      const previous = segments.at(-1);
+      if (previous && previous.key === key) {
+        previous.end = index;
+      } else {
+        segments.push({ key, start: index, end: index, target });
+      }
+    });
+
+    const step = days.length > 1 ? Math.abs(x(1) - x(0)) : width;
+    const band = (targetValue, threshold, className, segmentLeft, segmentWidth) => {
+      const target = trendCore.normalizeNightTime(targetValue, className === "bed" ? "bed" : "wake");
       const start = clamp(target - threshold, range.min, range.max);
       const end = clamp(target + threshold, range.min, range.max);
-      return `<rect class="target-band ${className}" x="${left}" y="${y(start)}" width="${width}" height="${Math.max(2, y(end) - y(start))}"></rect>`;
+      return `<rect class="target-band ${className}" x="${segmentLeft.toFixed(2)}" y="${y(start).toFixed(2)}" width="${segmentWidth.toFixed(2)}" height="${Math.max(2, y(end) - y(start)).toFixed(2)}"></rect>`;
     };
-    return `${band(targetBed, "bed")}${band(targetWake, "wake")}`;
+
+    return segments
+      .map((segment, index) => {
+        const segmentLeft = segment.start === 0 ? left : Math.max(left, x(segment.start) - step / 2);
+        const segmentRight = segment.end === days.length - 1 ? left + width : Math.min(left + width, x(segment.end) + step / 2);
+        const segmentWidth = Math.max(1, segmentRight - segmentLeft);
+        const changeLine = index
+          ? `<line class="target-change" x1="${segmentLeft.toFixed(2)}" y1="${y(range.min).toFixed(2)}" x2="${segmentLeft.toFixed(2)}" y2="${y(range.max).toFixed(2)}"></line>`
+          : "";
+        return `${band(segment.target.targetBed, segment.target.driftThreshold, "bed", segmentLeft, segmentWidth)}${band(segment.target.targetWake, segment.target.driftThreshold, "wake", segmentLeft, segmentWidth)}${changeLine}`;
+      })
+      .join("");
   }
 
   function makeTimeTicks(min, max, step) {
@@ -607,6 +695,10 @@
       <div class="detail-section">
         <span class="detail-label">状态</span>
         <div class="reason-list">${reasons}</div>
+      </div>
+      <div class="detail-section">
+        <span class="detail-label">当日目标</span>
+        <p class="detail-note">入睡 ${item.appliedTarget.targetBed} · 起床 ${item.appliedTarget.targetWake} · 允许偏差 ${item.appliedTarget.driftThreshold} 分钟</p>
       </div>
       ${tagsMarkup}
       ${item.note ? `<div class="detail-section"><span class="detail-label">备注</span><p class="detail-note">${escapeHtml(item.note)}</p></div>` : ""}
@@ -983,21 +1075,34 @@
       const settingsRef = doc(syncState.db, "users", syncState.user.uid, "profile", "settings");
       const entriesRef = collection(syncState.db, "users", syncState.user.uid, "entries");
       const [settingsSnapshot, entriesSnapshot] = await Promise.all([getDoc(settingsRef), getDocs(entriesRef)]);
-      const cloudSettings = settingsSnapshot.exists()
-        ? sanitizeSettings(settingsSnapshot.data(), { migrateLegacyThreshold: true })
-        : { ...defaultSettings };
+      const rawCloudSettings = settingsSnapshot.exists() ? settingsSnapshot.data() : null;
+      const cloudSettings = sanitizeSettings(rawCloudSettings || defaultSettings, {
+        migrateLegacyThreshold: true,
+      });
+      const shouldUpgradeCloudSettings = !rawCloudSettings || settingsNeedCloudUpgrade(rawCloudSettings, cloudSettings);
+      const shouldBackfillCloudSnapshots = Boolean(
+        rawCloudSettings && !trendCore.sanitizeTargetHistory(rawCloudSettings.targetHistory).length,
+      );
+      const legacyTargetHistory = shouldBackfillCloudSnapshots
+        ? legacyTargetHistoryForSettings(rawCloudSettings)
+        : [];
       const cloudEntries = entriesSnapshot.docs
         .map((entryDoc) => ({ ...entryDoc.data(), id: entryDoc.id }))
         .filter(isValidEntry)
         .map(normalizeEntryForSave);
       const overlay = applyPendingCloudOperations(cloudEntries, cloudSettings);
+      const snapshotBackfill = shouldBackfillCloudSnapshots
+        ? backfillTargetSnapshots(overlay.entries, legacyTargetHistory)
+        : { entries: overlay.entries, upserts: [] };
 
       state.settings = overlay.settings;
-      state.entries = overlay.entries;
+      state.entries = snapshotBackfill.entries;
       sortEntries();
       persistLocalOnly();
       hydrateForms();
       render();
+      if (snapshotBackfill.upserts.length) queueCloudUpserts(snapshotBackfill.upserts);
+      if (shouldUpgradeCloudSettings) queueCloudSettings(state.settings);
       syncState.lastSyncAt = new Date().toISOString();
       shouldFlush = hasPendingCloudOperations();
       setCloudUi("synced", `已读取云端：${cloudUserLabel(syncState.user)}`);
@@ -1243,12 +1348,15 @@
   }
 
   function exportCsv() {
-    const header = ["日期", "入睡时间", "起床时间", "睡眠时长", "影响因素", "备注"];
+    const header = ["日期", "入睡时间", "起床时间", "睡眠时长", "当日目标入睡", "当日目标起床", "偏离阈值", "影响因素", "备注"];
     const rows = analyzeEntries().items.map((item) => [
       item.date,
       item.bedTime,
       item.wakeTime,
       formatDuration(item.duration),
+      item.appliedTarget.targetBed,
+      item.appliedTarget.targetWake,
+      item.appliedTarget.driftThreshold,
       item.tags.join("；"),
       item.note || "",
     ]);
@@ -1258,7 +1366,7 @@
 
   function exportJson() {
     const payload = {
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       settings: state.settings,
       entries: state.entries,
@@ -1300,7 +1408,9 @@
   function loadEntries() {
     try {
       const entries = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
-      return Array.isArray(entries) ? trendCore.dedupeEntriesByDate(entries.filter(isValidEntry)) : [];
+      return Array.isArray(entries)
+        ? trendCore.dedupeEntriesByDate(entries.filter(isValidEntry).map(normalizeEntryForSave))
+        : [];
     } catch {
       return [];
     }
@@ -1309,14 +1419,12 @@
   function loadSettings() {
     try {
       const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-      const isOldDefault =
-        stored.targetBed === legacyDefaultSettings.targetBed && stored.targetWake === legacyDefaultSettings.targetWake;
-      if (isOldDefault) {
-        return { ...defaultSettings };
+      if (!trendCore.sanitizeTargetHistory(stored.targetHistory).length) {
+        pendingLocalSnapshotHistory = legacyTargetHistoryForSettings(stored);
       }
       return sanitizeSettings(stored, { migrateLegacyThreshold: true });
     } catch {
-      return { ...defaultSettings };
+      return sanitizeSettings(defaultSettings);
     }
   }
 
@@ -1391,6 +1499,10 @@
 
   function queueCloudUpsert(entry) {
     enqueueCloudOperations([{ type: "upsert", entry }]);
+  }
+
+  function queueCloudUpserts(entries) {
+    enqueueCloudOperations(entries.map((entry) => ({ type: "upsert", entry })));
   }
 
   function queueCloudDelete(id) {
@@ -1486,23 +1598,109 @@
     );
   }
 
-  function sanitizeSettings(settings, options = {}) {
-    const rawThreshold = Number(settings.driftThreshold);
+  function sanitizeSettings(settings = {}, options = {}) {
+    const source = settings && typeof settings === "object" ? settings : {};
+    const rawThreshold = Number(source.driftThreshold);
     const threshold = Number.isFinite(rawThreshold)
       ? clamp(rawThreshold, 15, 120)
       : defaultSettings.driftThreshold;
-    return {
-      targetBed: trendCore.isValidTimeString(settings.targetBed) ? settings.targetBed : defaultSettings.targetBed,
-      targetWake: trendCore.isValidTimeString(settings.targetWake) ? settings.targetWake : defaultSettings.targetWake,
+    let currentTarget = {
+      targetBed: trendCore.isValidTimeString(source.targetBed) ? source.targetBed : defaultSettings.targetBed,
+      targetWake: trendCore.isValidTimeString(source.targetWake) ? source.targetWake : defaultSettings.targetWake,
       driftThreshold:
         options.migrateLegacyThreshold && threshold === legacyDefaultSettings.driftThreshold
           ? defaultSettings.driftThreshold
           : threshold,
     };
+    let targetHistory = trendCore
+      .sanitizeTargetHistory(source.targetHistory)
+      .map((target) => ({ ...target, driftThreshold: clamp(target.driftThreshold, 15, 120) }));
+    const hasExplicitTarget =
+      trendCore.isValidTimeString(source.targetBed) && trendCore.isValidTimeString(source.targetWake);
+    const shouldRestoreKnownHistory =
+      options.migrateKnownHistory !== false &&
+      !targetHistory.length &&
+      currentTarget.targetBed === "23:00" &&
+      ["06:30", "06:50", "07:00"].includes(currentTarget.targetWake) &&
+      currentTarget.driftThreshold === 30;
+
+    if (shouldRestoreKnownHistory) {
+      targetHistory = knownTargetHistory.map((target) => ({ ...target }));
+      currentTarget = { ...defaultSettings };
+    } else if (!targetHistory.length) {
+      targetHistory = [
+        {
+          effectiveFrom: hasExplicitTarget ? "0001-01-01" : WAKE_620_EFFECTIVE_FROM,
+          ...currentTarget,
+        },
+      ];
+      if (currentTarget.targetWake !== defaultSettings.targetWake) {
+        currentTarget = { ...currentTarget, targetWake: defaultSettings.targetWake };
+        targetHistory = trendCore.upsertTargetHistory(
+          targetHistory,
+          currentTarget,
+          WAKE_620_EFFECTIVE_FROM,
+        );
+      }
+    }
+
+    const activeTarget = trendCore.resolveTargetForDate({ date: todayString() }, { targetHistory });
+    return {
+      targetBed: activeTarget.targetBed,
+      targetWake: activeTarget.targetWake,
+      driftThreshold: activeTarget.driftThreshold,
+      targetHistoryVersion: TARGET_HISTORY_VERSION,
+      targetHistory,
+    };
+  }
+
+  function legacyTargetHistoryForSettings(settings = {}) {
+    const rawThreshold = Number(settings.driftThreshold);
+    const threshold = Number.isFinite(rawThreshold)
+      ? clamp(
+          rawThreshold === legacyDefaultSettings.driftThreshold
+            ? defaultSettings.driftThreshold
+            : rawThreshold,
+          15,
+          120,
+        )
+      : defaultSettings.driftThreshold;
+    const legacyTarget = {
+      targetBed: trendCore.isValidTimeString(settings.targetBed) ? settings.targetBed : defaultSettings.targetBed,
+      targetWake: trendCore.isValidTimeString(settings.targetWake) ? settings.targetWake : defaultSettings.targetWake,
+      driftThreshold: threshold,
+    };
+    const matchesKnownHistory =
+      legacyTarget.targetBed === "23:00" &&
+      ["06:30", "06:50", "07:00"].includes(legacyTarget.targetWake) &&
+      legacyTarget.driftThreshold === 30;
+    return matchesKnownHistory
+      ? knownTargetHistory.slice(0, -1).map((target) => ({ ...target }))
+      : [{ effectiveFrom: "0001-01-01", ...legacyTarget }];
+  }
+
+  function backfillTargetSnapshots(entries, targetHistory) {
+    const upserts = [];
+    const migratedEntries = entries.map((entry) => {
+      if (normalizeTargetSnapshot(entry.targetSnapshot)) return entry;
+      const target = trendCore.resolveTargetForDate({ date: entry.date }, { targetHistory });
+      const migrated = {
+        ...entry,
+        targetSnapshot: {
+          targetBed: target.targetBed,
+          targetWake: target.targetWake,
+          driftThreshold: target.driftThreshold,
+          effectiveFrom: target.effectiveFrom || entry.date,
+        },
+      };
+      upserts.push(migrated);
+      return migrated;
+    });
+    return { entries: migratedEntries, upserts };
   }
 
   function normalizeEntryForSave(entry) {
-    return {
+    const normalized = {
       id: entry.id,
       date: entry.date,
       bedTime: entry.bedTime,
@@ -1511,6 +1709,46 @@
       note: entry.note || "",
       updatedAt: entry.updatedAt || new Date().toISOString(),
     };
+    const targetSnapshot = normalizeTargetSnapshot(entry.targetSnapshot);
+    if (targetSnapshot) normalized.targetSnapshot = targetSnapshot;
+    return normalized;
+  }
+
+  function normalizeTargetSnapshot(targetSnapshot) {
+    if (!trendCore.isValidTargetConfig(targetSnapshot)) return null;
+    const normalized = {
+      targetBed: targetSnapshot.targetBed,
+      targetWake: targetSnapshot.targetWake,
+      driftThreshold: clamp(Number(targetSnapshot.driftThreshold), 15, 120),
+    };
+    if (trendCore.isValidDateString(targetSnapshot.effectiveFrom)) {
+      normalized.effectiveFrom = targetSnapshot.effectiveFrom;
+    }
+    return normalized;
+  }
+
+  function makeTargetSnapshot(date, existingSnapshot) {
+    const existing = normalizeTargetSnapshot(existingSnapshot);
+    if (existing) return existing;
+    const target = trendCore.resolveTargetForDate({ date }, state.settings);
+    return {
+      targetBed: target.targetBed,
+      targetWake: target.targetWake,
+      driftThreshold: target.driftThreshold,
+      effectiveFrom: target.effectiveFrom || date,
+    };
+  }
+
+  function settingsNeedCloudUpgrade(raw, sanitized) {
+    const rawHistory = trendCore.sanitizeTargetHistory(raw && raw.targetHistory);
+    return Boolean(
+      !raw ||
+        raw.targetHistoryVersion !== TARGET_HISTORY_VERSION ||
+        raw.targetBed !== sanitized.targetBed ||
+        raw.targetWake !== sanitized.targetWake ||
+        Number(raw.driftThreshold) !== Number(sanitized.driftThreshold) ||
+        JSON.stringify(rawHistory) !== JSON.stringify(sanitized.targetHistory),
+    );
   }
 
   function sortEntries() {
@@ -1547,6 +1785,13 @@
   function formatDate(date) {
     const parsed = new Date(`${date}T00:00:00`);
     return parsed.toLocaleDateString("zh-CN", { month: "short", day: "numeric", weekday: "short" });
+  }
+
+  function formatHistoryDate(date) {
+    if (!trendCore.isValidDateString(date)) return "今天";
+    const [year, month, day] = date.split("-").map(Number);
+    if (date === "0001-01-01") return "最早记录";
+    return `${year}年${month}月${day}日`;
   }
 
   function shortDate(date) {

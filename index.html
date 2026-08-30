@@ -4,10 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>晨昏记</title>
-    <link rel="stylesheet" href="./styles.css?v=20260711-wake-default" />
+    <link rel="stylesheet" href="./styles.css?v=20260831-target-history" />
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
-    <script src="./trend-core.js?v=20260711-wake-default" defer></script>
-    <script src="./app.js?v=20260711-wake-default" defer></script>
+    <script src="./trend-core.js?v=20260831-target-history" defer></script>
+    <script src="./app.js?v=20260831-target-history" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -98,6 +98,15 @@
                 <span>偏离阈值 <b id="driftValue"></b></span>
                 <input id="driftThreshold" name="driftThreshold" type="range" min="15" max="120" step="15" />
               </label>
+              <p class="target-effective-status" id="targetEffectiveStatus"></p>
+              <button class="text-button target-save-button" type="submit">
+                <i data-lucide="calendar-check"></i>
+                从今天起使用
+              </button>
+              <details class="target-history">
+                <summary>查看目标历史</summary>
+                <div class="target-history-list" id="targetHistoryList"></div>
+              </details>
             </form>
           </section>
 
@@ -165,7 +174,7 @@
               <aside class="night-detail" id="dayDetail" aria-live="polite"></aside>
             </div>
 
-            <p class="chart-caveat">时间轴按本地睡眠日展示；目标参考线随当前设置更新。</p>
+            <p class="chart-caveat">时间轴按本地睡眠日展示；目标背景与偏离判断均按当日生效目标计算。</p>
           </section>
 
           <div class="stats-grid" id="statsGrid"></div>

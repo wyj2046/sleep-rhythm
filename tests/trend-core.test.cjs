@@ -3,6 +3,16 @@ const assert = require("node:assert/strict");
 const core = require("../trend-core.js");
 
 const settings = { targetBed: "23:00", targetWake: "07:00", driftThreshold: 30 };
+const historicalSettings = {
+  targetBed: "23:00",
+  targetWake: "06:20",
+  driftThreshold: 30,
+  targetHistory: [
+    { effectiveFrom: "2026-05-29", targetBed: "23:00", targetWake: "06:50", driftThreshold: 30 },
+    { effectiveFrom: "2026-07-11", targetBed: "23:00", targetWake: "06:30", driftThreshold: 30 },
+    { effectiveFrom: "2026-08-31", targetBed: "23:00", targetWake: "06:20", driftThreshold: 30 },
+  ],
+};
 
 function entry(id, date, bedTime, wakeTime = "07:00") {
   return { id, date, bedTime, wakeTime, tags: [], note: "" };
@@ -87,4 +97,63 @@ test("preserves existing anomaly thresholds at exact boundaries", () => {
   assert.equal(byId.get("late").targetReasons[0].type, "late-bed");
   assert.equal(byId.get("short").targetReasons.some((reason) => reason.type === "short-sleep"), true);
   assert.equal(byId.get("six").targetReasons.some((reason) => reason.type === "short-sleep"), false);
+});
+
+test("uses the target that was effective on each record date", () => {
+  const analyzed = core.analyzeEntries(
+    [
+      entry("before-first", "2026-05-01", "23:00", "07:20"),
+      entry("old-stable", "2026-07-10", "23:00", "07:20"),
+      entry("middle-late", "2026-07-11", "23:00", "07:20"),
+      entry("boundary", "2026-08-31", "23:00", "06:50"),
+      entry("new-late", "2026-09-01", "23:00", "06:51"),
+    ],
+    historicalSettings,
+  );
+  const byId = new Map(analyzed.items.map((item) => [item.id, item]));
+
+  assert.equal(byId.get("before-first").appliedTarget.targetWake, "06:50");
+  assert.equal(byId.get("old-stable").stable, true);
+  assert.equal(byId.get("middle-late").targetReasons[0].minutes, 50);
+  assert.equal(byId.get("boundary").stable, true);
+  assert.equal(byId.get("new-late").targetReasons[0].minutes, 31);
+});
+
+test("lets a saved target snapshot take precedence over later setting changes", () => {
+  const analyzed = core.analyzeEntries(
+    [
+      {
+        ...entry("snapshot", "2026-09-01", "23:20", "07:10"),
+        targetSnapshot: {
+          effectiveFrom: "2026-07-11",
+          targetBed: "23:00",
+          targetWake: "06:50",
+          driftThreshold: 30,
+        },
+      },
+    ],
+    historicalSettings,
+  );
+  const item = analyzed.items[0];
+  assert.equal(item.appliedTarget.source, "snapshot");
+  assert.equal(item.appliedTarget.targetWake, "06:50");
+  assert.equal(item.stable, true);
+});
+
+test("normalizes target history and replaces repeated changes on the same day", () => {
+  const dirtyHistory = [
+    { effectiveFrom: "2026-08-31", targetBed: "23:00", targetWake: "06:30", driftThreshold: 30 },
+    { effectiveFrom: "not-a-date", targetBed: "23:00", targetWake: "05:00", driftThreshold: 30 },
+    { effectiveFrom: "2026-07-11", targetBed: "23:00", targetWake: "06:30", driftThreshold: 30 },
+    { effectiveFrom: "2026-08-31", targetBed: "23:00", targetWake: "06:25", driftThreshold: 30 },
+  ];
+  const updated = core.upsertTargetHistory(
+    dirtyHistory,
+    { targetBed: "23:00", targetWake: "06:20", driftThreshold: 45 },
+    "2026-08-31",
+  );
+
+  assert.deepEqual(updated.map((target) => target.effectiveFrom), ["2026-07-11", "2026-08-31"]);
+  assert.equal(updated.at(-1).targetWake, "06:20");
+  assert.equal(updated.at(-1).driftThreshold, 45);
 });
