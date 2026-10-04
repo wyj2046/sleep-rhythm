@@ -157,3 +157,141 @@ test("normalizes target history and replaces repeated changes on the same day", 
   assert.equal(updated.at(-1).targetWake, "06:20");
   assert.equal(updated.at(-1).driftThreshold, 45);
 });
+
+test("summarizes calendar windows anchored to the latest record, with recent rule counts", () => {
+  const firstDay = core.dateToDayNumber("2026-08-25");
+  const raw = Array.from({ length: 40 }, (_, index) => entry(
+    String(index),
+    core.dayNumberToDate(firstDay + index),
+    index === 0 || index === 38 ? "00:00" : "23:00",
+    "06:20",
+  ));
+  const { items } = core.analyzeEntries(raw, historicalSettings);
+  const recent = core.getRecentSummary(items, { asOfDate: "2026-10-04" });
+  assert.equal(recent.startDate, "2026-09-06");
+  assert.equal(recent.endDate, "2026-10-03");
+  assert.equal(recent.expectedDays, 28);
+  assert.equal(recent.count, 28);
+  assert.equal(recent.withinRuleCount, 27);
+  assert.equal(recent.anomalyCount, 1);
+  assert.equal(recent.averageDuration, (27 * 440 + 380) / 28);
+  assert.equal(recent.averageWake, 1820);
+  assert.equal(recent.lastAnomaly.date, "2026-10-02");
+  assert.equal(recent.consecutiveWithinRules, 1);
+  assert.equal(recent.unrecordedSinceLatest, 0);
+  assert.equal(recent.todayRecorded, false);
+  const week = core.getRecentSummary(items, { asOfDate: "2026-10-04", windowDays: 7 });
+  assert.equal(week.startDate, "2026-09-27");
+  assert.equal(week.count, 7);
+  assert.equal(week.withinRuleCount, 6);
+});
+
+test("reports missing dates without counting them as observations or crossing them in a streak", () => {
+  const { items } = core.analyzeEntries([
+    entry("1", "2026-09-28", "23:00"),
+    entry("2", "2026-09-30", "23:00"),
+    entry("3", "2026-10-01", "23:00"),
+  ], settings);
+  const summary = core.getRecentSummary(items, { asOfDate: "2026-10-04" });
+  assert.equal(summary.startDate, "2026-09-28");
+  assert.equal(summary.endDate, "2026-10-01");
+  assert.equal(summary.expectedDays, 4);
+  assert.equal(summary.count, 3);
+  assert.equal(summary.withinRuleCount, 3);
+  assert.equal(summary.consecutiveWithinRules, 2);
+  assert.deepEqual(summary.missingDatesInWindow, ["2026-09-29"]);
+  assert.equal(summary.unrecordedSinceLatest, 2);
+  assert.deepEqual(summary.unrecordedDatesSinceLatest, ["2026-10-02", "2026-10-03"]);
+  assert.equal(summary.unrecordedDatesTruncated, false);
+  assert.equal(summary.lastAnomaly, null);
+});
+
+test("averages normalized overnight times rather than raw clock minutes", () => {
+  const { items } = core.analyzeEntries([
+    entry("1", "2026-09-30", "17:00", "23:50"),
+    entry("2", "2026-10-01", "17:00", "00:10"),
+  ], { targetBed: "17:00", targetWake: "00:00", driftThreshold: 30 });
+  const summary = core.getRecentSummary(items, { asOfDate: "2026-10-02" });
+  assert.equal(summary.averageWake, 1440);
+  assert.equal(summary.averageDuration, 420);
+  assert.equal(summary.withinRuleCount, 2);
+  assert.equal(summary.expectedDays, 2);
+});
+
+test("keeps historical and snapshot targets in recent counts", () => {
+  const { items } = core.analyzeEntries([
+    entry("old", "2026-07-10", "23:00", "07:10"),
+    entry("changed", "2026-07-11", "23:00", "07:10"),
+    {
+      ...entry("snapshot", "2026-07-12", "23:00", "07:10"),
+      targetSnapshot: { targetBed: "23:00", targetWake: "06:50", driftThreshold: 30 },
+    },
+  ], historicalSettings);
+  const summary = core.getRecentSummary(items, { asOfDate: "2026-07-13", windowDays: 3 });
+  assert.equal(summary.withinRuleCount, 2);
+  assert.equal(summary.anomalyCount, 1);
+  assert.equal(summary.lastAnomaly.id, "changed");
+  assert.equal(summary.consecutiveWithinRules, 1);
+});
+
+test("ignores future and invalid records and deduplicates before computing statistics", () => {
+  const { items } = core.analyzeEntries([
+    { ...entry("newer", "2026-10-03", "23:00"), updatedAt: "2026-10-04T00:00:00Z" },
+    { ...entry("older", "2026-10-03", "00:00"), updatedAt: "2026-10-03T00:00:00Z" },
+    entry("future", "2026-10-05", "01:00"),
+    entry("today", "2026-10-04", "23:00"),
+    entry("invalid-date", "2026-09-31", "23:00"),
+    entry("invalid-time", "2026-10-02", "25:00"),
+  ], settings);
+  const before = structuredClone(items);
+  const summary = core.getRecentSummary(items, { asOfDate: "2026-10-04" });
+  assert.equal(summary.latestDate, "2026-10-04");
+  assert.equal(summary.count, 2);
+  assert.equal(summary.withinRuleCount, 2);
+  assert.equal(summary.anomalyCount, 0);
+  assert.equal(summary.todayRecorded, true);
+  assert.equal(summary.unrecordedSinceLatest, 0);
+  assert.equal(summary.lastAnomaly, null);
+  assert.deepEqual(items, before);
+});
+
+test("keeps consecutive days and the latest anomaly independent of the selected window", () => {
+  const firstDay = core.dateToDayNumber("2026-09-01");
+  const { items } = core.analyzeEntries(Array.from({ length: 30 }, (_, index) => entry(
+    String(index), core.dayNumberToDate(firstDay + index), index === 0 ? "00:00" : "23:00",
+  )), settings);
+  const summary = core.getRecentSummary(items, { asOfDate: "2026-10-01", windowDays: 7 });
+  assert.equal(summary.count, 7);
+  assert.equal(summary.anomalyCount, 0);
+  assert.equal(summary.consecutiveWithinRules, 29);
+  assert.equal(summary.lastAnomaly.date, "2026-09-01");
+});
+
+test("bounds expanded missing dates for old records while preserving the total", () => {
+  const { items } = core.analyzeEntries([entry("old", "2020-01-01", "23:00")], settings);
+  const summary = core.getRecentSummary(items, { asOfDate: "2026-10-04" });
+  assert.equal(summary.unrecordedSinceLatest, core.dateToDayNumber("2026-10-04") - core.dateToDayNumber("2020-01-01") - 1);
+  assert.equal(summary.unrecordedDatesSinceLatest.length, 31);
+  assert.equal(summary.unrecordedDatesSinceLatest[0], "2026-09-03");
+  assert.equal(summary.unrecordedDatesSinceLatest.at(-1), "2026-10-03");
+  assert.equal(summary.unrecordedDatesTruncated, true);
+});
+
+test("returns explicit empty summary values when there are no available observations", () => {
+  const empty = core.getRecentSummary([], { asOfDate: "2026-10-04" });
+  assert.equal(empty.count, 0);
+  assert.equal(empty.expectedDays, 0);
+  assert.equal(empty.latestDate, null);
+  assert.equal(empty.startDate, null);
+  assert.equal(empty.endDate, null);
+  assert.equal(empty.averageDuration, null);
+  assert.equal(empty.averageWake, null);
+  assert.equal(empty.consecutiveWithinRules, 0);
+  assert.equal(empty.unrecordedSinceLatest, 0);
+  assert.equal(empty.todayRecorded, false);
+  assert.equal(empty.lastAnomaly, null);
+  assert.deepEqual(empty.missingDatesInWindow, []);
+  const futureItems = core.analyzeEntries([entry("future", "2026-10-05", "23:00")], settings).items;
+  assert.deepEqual(core.getRecentSummary(futureItems, { asOfDate: "2026-10-04" }), empty);
+  assert.equal(core.getRecentSummary().asOfDate, null);
+});

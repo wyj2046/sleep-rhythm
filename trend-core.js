@@ -176,6 +176,77 @@
     return [date.getUTCFullYear(), String(date.getUTCMonth() + 1).padStart(2, "0"), String(date.getUTCDate()).padStart(2, "0")].join("-");
   }
 
+  // Summarize analyzeEntries().items against an explicit calendar date. The
+  // observation window ends at the latest available record; missing dates after
+  // it are reported separately so an old window never looks current by accident.
+  function getRecentSummary(items, { asOfDate, windowDays = 28 } = {}) {
+    const days = Number.isInteger(windowDays) && windowDays > 0 ? windowDays : 28;
+    const validItems = dedupeEntriesByDate(Array.isArray(items) ? items : []);
+    const cutoff = isValidDateString(asOfDate) ? asOfDate : validItems.at(-1)?.date || null;
+    const observations = validItems.filter((item) => !cutoff || item.date <= cutoff);
+    const latestDate = observations.at(-1)?.date || null;
+    const result = {
+      asOfDate: cutoff,
+      windowDays: days,
+      startDate: null,
+      endDate: latestDate,
+      expectedDays: 0,
+      count: 0,
+      withinRuleCount: 0,
+      anomalyCount: 0,
+      averageDuration: null,
+      averageWake: null,
+      consecutiveWithinRules: 0,
+      missingDatesInWindow: [],
+      latestDate,
+      unrecordedSinceLatest: 0,
+      unrecordedDatesSinceLatest: [],
+      unrecordedDatesTruncated: false,
+      todayRecorded: Boolean(latestDate && latestDate === cutoff),
+      lastAnomaly: null,
+    };
+    if (!latestDate) return result;
+
+    const withinRules = (item) => Array.isArray(item.targetReasons)
+      ? item.targetReasons.length === 0
+      : item.stable === true;
+    const endDay = dateToDayNumber(latestDate);
+    const startDay = Math.max(dateToDayNumber(observations[0].date), endDay - days + 1);
+    result.startDate = dayNumberToDate(startDay);
+    result.expectedDays = endDay - startDay + 1;
+    const recentItems = observations.filter((item) => item.date >= result.startDate);
+    const recordedDates = new Set(recentItems.map((item) => item.date));
+    result.count = recentItems.length;
+    result.withinRuleCount = recentItems.filter(withinRules).length;
+    result.anomalyCount = result.count - result.withinRuleCount;
+    result.averageDuration = recentItems.reduce((sum, item) => sum + item.duration, 0) / result.count;
+    result.averageWake = recentItems.reduce((sum, item) => sum + item.wakeNorm, 0) / result.count;
+    for (let day = startDay; day <= endDay; day += 1) {
+      const date = dayNumberToDate(day);
+      if (!recordedDates.has(date)) result.missingDatesInWindow.push(date);
+    }
+
+    let expectedDay = endDay;
+    for (let index = observations.length - 1; index >= 0; index -= 1) {
+      const item = observations[index];
+      if (dateToDayNumber(item.date) !== expectedDay || !withinRules(item)) break;
+      result.consecutiveWithinRules += 1;
+      expectedDay -= 1;
+    }
+    result.lastAnomaly = observations.slice().reverse().find((item) => !withinRules(item)) || null;
+
+    const cutoffDay = dateToDayNumber(cutoff);
+    result.unrecordedSinceLatest = Math.max(0, cutoffDay - endDay - 1);
+    // Keep the total accurate even for stale backups, but only expand a bounded
+    // set of recent dates for the UI's backfill shortcuts. Today is not missing.
+    const listedDays = Math.min(result.unrecordedSinceLatest, 31);
+    result.unrecordedDatesTruncated = listedDays < result.unrecordedSinceLatest;
+    for (let day = cutoffDay - listedDays; day < cutoffDay; day += 1) {
+      result.unrecordedDatesSinceLatest.push(dayNumberToDate(day));
+    }
+    return result;
+  }
+
   function buildCalendarTimeline(items) {
     const normalizedItems = dedupeEntriesByDate(items);
     if (!normalizedItems.length) return [];
@@ -303,6 +374,7 @@
     analyzeEntries,
     dateToDayNumber,
     dayNumberToDate,
+    getRecentSummary,
     buildCalendarTimeline,
     groupTimelineByMonth,
     sortMonthsNewestFirst,

@@ -23,6 +23,7 @@
     { effectiveFrom: WAKE_620_EFFECTIVE_FROM, ...defaultSettings },
   ];
   const trendCore = window.SleepTrendCore;
+  const entryDetails = window.SleepEntryDetails;
 
   if (!trendCore) {
     throw new Error("SleepTrendCore failed to load.");
@@ -56,10 +57,14 @@
     flushPromise: null,
   };
   const trendUi = {
-    selectedDate: null,
+    selectedDate: "",
+    activeMonth: "",
+    showHistory: false,
+    summaryDays: 28,
     showMedian: loadChartPreferences().showMedian !== false,
   };
   const cloudQueue = loadCloudQueue();
+  const formDraftState = { entryDirty: false, settingsDirty: false };
 
   const $ = (selector) => document.querySelector(selector);
   const els = {
@@ -69,6 +74,13 @@
     sleepDate: $("#sleepDate"),
     bedTime: $("#bedTime"),
     wakeTime: $("#wakeTime"),
+    bedTimeKind: $("#bedTimeKind"),
+    sleepOnsetTime: $("#sleepOnsetTime"),
+    finalWakeTime: $("#finalWakeTime"),
+    awakeMinutes: $("#awakeMinutes"),
+    morningFeeling: $("#morningFeeling"),
+    sleepDetails: $("#sleepDetails"),
+    entryMessage: $("#entryMessage"),
     note: $("#note"),
     tagGrid: $("#tagGrid"),
     targetBed: $("#targetBed"),
@@ -78,6 +90,14 @@
     targetEffectiveStatus: $("#targetEffectiveStatus"),
     targetHistoryList: $("#targetHistoryList"),
     statsGrid: $("#statsGrid"),
+    summaryText: $("#summaryText"),
+    periodSwitch: $(".period-switch"),
+    dataFreshness: $("#dataFreshness"),
+    recordCoverage: $("#recordCoverage"),
+    checkSyncBtn: $("#checkSyncBtn"),
+    historyToggle: $("#historyToggle"),
+    entrySearch: $("#entrySearch"),
+    recordTodayLink: $(".record-link"),
     chart: $("#trendChart"),
     rangeLabel: $("#rangeLabel"),
     trendTitle: $("#trendTitle"),
@@ -124,6 +144,10 @@
     els.form.addEventListener("submit", saveEntry);
     els.resetFormBtn.addEventListener("click", resetEntryForm);
     els.settingsForm.addEventListener("submit", saveSettings);
+    ["input", "change"].forEach((eventName) => {
+      els.form.addEventListener(eventName, () => { formDraftState.entryDirty = true; });
+      els.settingsForm.addEventListener(eventName, () => { formDraftState.settingsDirty = true; });
+    });
     els.driftThreshold.addEventListener("input", () => {
       els.driftValue.textContent = `${Number(els.driftThreshold.value) || defaultSettings.driftThreshold} 分钟`;
     });
@@ -134,6 +158,29 @@
     els.signInBtn.addEventListener("click", signInWithGoogle);
     els.signOutBtn.addEventListener("click", signOutCloud);
     els.syncNowBtn.addEventListener("click", refreshCloudData);
+    els.checkSyncBtn.addEventListener("click", refreshCloudData);
+    els.periodSwitch.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-summary-days]");
+      if (!button) return;
+      trendUi.summaryDays = Number(button.dataset.summaryDays);
+      const analysis = analyzeEntries();
+      renderStats(analysis);
+      renderAnomalies(analysis);
+    });
+    els.historyToggle.addEventListener("click", () => {
+      trendUi.showHistory = !trendUi.showHistory;
+      renderChart();
+    });
+    els.entrySearch.addEventListener("input", () => renderEntries(analyzeEntries()));
+    els.recordTodayLink.addEventListener("click", (event) => {
+      event.preventDefault();
+      const todayEntry = state.entries.find((entry) => entry.date === todayString());
+      const opened = todayEntry ? editEntry(todayEntry) : resetEntryForm();
+      if (!opened) return;
+      window.location.hash = "entryForm";
+      els.form.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
+      els.sleepDate.focus({ preventScroll: true });
+    });
     els.medianToggle.addEventListener("change", toggleMedian);
     els.monthJump.addEventListener("click", handleMonthJump);
     els.monthCharts.addEventListener("click", handleTrendClick);
@@ -170,13 +217,18 @@
   }
 
   function hydrateForms() {
-    els.sleepDate.value = todayString();
-    els.bedTime.value = state.settings.targetBed;
-    els.wakeTime.value = state.settings.targetWake;
-    els.targetBed.value = state.settings.targetBed;
-    els.targetWake.value = state.settings.targetWake;
-    els.driftThreshold.value = state.settings.driftThreshold;
-    els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
+    // Cloud refreshes may finish after the user has started typing or editing.
+    if (!formDraftState.entryDirty && !els.editingId.value) {
+      els.sleepDate.value = todayString();
+      els.bedTime.value = state.settings.targetBed;
+      els.wakeTime.value = state.settings.targetWake;
+    }
+    if (!formDraftState.settingsDirty) {
+      els.targetBed.value = state.settings.targetBed;
+      els.targetWake.value = state.settings.targetWake;
+      els.driftThreshold.value = state.settings.driftThreshold;
+      els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
+    }
     renderTargetHistory();
   }
 
@@ -192,7 +244,7 @@
           <div class="target-history-item">
             <time datetime="${target.effectiveFrom}">${formatHistoryDate(target.effectiveFrom)}</time>
             <strong>${target.targetBed} → ${target.targetWake}</strong>
-            <span>±${target.driftThreshold} 分钟</span>
+            <span>晚于目标超过 ${target.driftThreshold} 分钟时标记</span>
           </div>
         `,
       )
@@ -202,16 +254,37 @@
   function saveEntry(event) {
     event.preventDefault();
     const date = els.sleepDate.value;
+    const details = {
+      bedTimeKind: els.bedTimeKind.value,
+      sleepOnsetTime: els.sleepOnsetTime.value,
+      finalWakeTime: els.finalWakeTime.value,
+      awakeMinutes: els.awakeMinutes.value,
+      morningFeeling: els.morningFeeling.value,
+    };
+    const error = entryDetails.validate({ ...details, bedTime: els.bedTime.value, wakeTime: els.wakeTime.value });
+    if (error) {
+      els.entryMessage.hidden = false;
+      els.entryMessage.textContent = error.message;
+      els.entryMessage.dataset.tone = "error";
+      if (["sleepOnsetTime", "finalWakeTime", "awakeMinutes"].includes(error.field)) els.sleepDetails.open = true;
+      els[error.field].focus();
+      return;
+    }
     const requestedId = els.editingId.value || makeId();
     const currentIndex = state.entries.findIndex((item) => item.id === requestedId);
     const currentEntry = currentIndex >= 0 ? state.entries[currentIndex] : null;
     const sameDateEntry = state.entries.find((item) => item.date === date);
+    const collidingEntry = state.entries.find((item) => item.date === date && item.id !== requestedId);
+    if (collidingEntry && !confirm(`${formatDate(date)} 已有记录：${collidingEntry.bedTime} → ${collidingEntry.wakeTime}。保存将替换这条记录，是否继续？`)) {
+      return;
+    }
     const snapshotSource = currentEntry && currentEntry.date === date ? currentEntry : sameDateEntry;
     const entry = {
       id: requestedId,
       date,
       bedTime: els.bedTime.value,
       wakeTime: els.wakeTime.value,
+      ...entryDetails.normalize(details),
       tags: Array.from(document.querySelectorAll('input[name="tags"]:checked')).map((input) => input.value),
       note: els.note.value.trim(),
       targetSnapshot: makeTargetSnapshot(date, snapshotSource && snapshotSource.targetSnapshot),
@@ -241,7 +314,10 @@
     persistEntries();
     replacedIds.forEach(queueCloudDelete);
     queueCloudUpsert(savedEntry);
-    resetEntryForm();
+    resetEntryForm({ force: true });
+    els.entryMessage.textContent = `${formatDate(date)}的记录已保存。`;
+    els.entryMessage.dataset.tone = "success";
+    els.entryMessage.hidden = false;
     render();
   }
 
@@ -262,28 +338,42 @@
       },
       { migrateKnownHistory: false },
     );
-    if (!els.editingId.value && (!els.bedTime.value || els.bedTime.value === previousTargetBed)) {
+    if (!formDraftState.entryDirty && !els.editingId.value && (!els.bedTime.value || els.bedTime.value === previousTargetBed)) {
       els.bedTime.value = state.settings.targetBed;
     }
-    if (!els.editingId.value && (!els.wakeTime.value || els.wakeTime.value === previousTargetWake)) {
+    if (!formDraftState.entryDirty && !els.editingId.value && (!els.wakeTime.value || els.wakeTime.value === previousTargetWake)) {
       els.wakeTime.value = state.settings.targetWake;
     }
     els.driftValue.textContent = `${state.settings.driftThreshold} 分钟`;
     renderTargetHistory();
     persistSettings();
     queueCloudSettings(state.settings);
+    formDraftState.settingsDirty = false;
     render();
   }
 
-  function resetEntryForm() {
+  function hydrateEntryDetails(entry = null) {
+    els.bedTimeKind.value = entry ? entry.bedTimeKind || "unspecified" : "bed";
+    for (const key of ["sleepOnsetTime", "finalWakeTime", "awakeMinutes", "morningFeeling"]) {
+      els[key].value = entry && entry[key] != null ? entry[key] : "";
+    }
+    els.sleepDetails.open = Boolean(entry && ["sleepOnsetTime", "finalWakeTime", "awakeMinutes", "morningFeeling"].some((key) => entry[key] != null));
+    els.entryMessage.hidden = true;
+  }
+
+  function resetEntryForm(options = {}) {
+    if (!options.force && formDraftState.entryDirty && !confirm("当前记录有未保存的修改。放弃修改并新建记录？")) return false;
     els.editingId.value = "";
     els.sleepDate.value = todayString();
     els.bedTime.value = state.settings.targetBed;
     els.wakeTime.value = state.settings.targetWake;
     els.note.value = "";
+    hydrateEntryDetails();
     renderTags();
+    formDraftState.entryDirty = false;
     els.form.querySelector(".primary-button").innerHTML = '<i data-lucide="save"></i>保存记录';
     window.lucide && window.lucide.createIcons();
+    return true;
   }
 
   function render() {
@@ -295,48 +385,37 @@
     renderEntries(analysis);
   }
 
+  function recentSummary(analysis) {
+    return trendCore.getRecentSummary(analysis.items, { asOfDate: todayString(), windowDays: trendUi.summaryDays });
+  }
+
   function renderStats(analysis) {
-    const latest = analysis.items.at(-1);
-    const stableDays = countStableDays(analysis.items);
-    const averageDuration = average(
-      analysis.items.map((item) => item.duration).filter((duration) => Number.isFinite(duration)),
-    );
-    const recovery = latest ? recoveryLabel(analysis.items) : "暂无";
-
+    const summary = recentSummary(analysis);
+    const last = summary.lastAnomaly;
+    const lastInWindow = last && last.date >= summary.startDate;
+    els.trendTitle.textContent = summary.count
+      ? `最近 ${summary.expectedDays} 天，${summary.withinRuleCount} 晚未触发时间规则`
+      : "从今天开始，认识自己的节律";
+    els.summaryText.textContent = summary.count
+      ? `${shortDate(summary.startDate)}—${shortDate(summary.endDate)} · 已记录 ${summary.count}/${summary.expectedDays} 晚。${lastInWindow ? `最近一次标记在 ${shortDate(last.date)}：${last.targetReasons.join("、")}。` : "这段时间的记录均未触发时间规则。"}`
+      : "记下就寝与离床时间，再慢慢观察变化。";
+    const wake = Number.isFinite(summary.averageWake) ? Math.round(summary.averageWake) % 1440 : null;
     const cards = [
-      {
-        label: "记录天数",
-        value: String(analysis.items.length),
-        hint: latest ? formatDate(latest.date) : "从今晚开始",
-      },
-      {
-        label: "当前稳定",
-        value: `${stableDays} 天`,
-        hint: "目标范围内",
-      },
-      {
-        label: "平均睡眠",
-        value: averageDuration ? formatDuration(averageDuration) : "暂无",
-        hint: "按已记录天数",
-      },
-      {
-        label: "最近恢复",
-        value: recovery,
-        hint: "从上次明显偏离后",
-      },
+      { label: "时间规则内", value: summary.count ? `${summary.withinRuleCount} / ${summary.count}` : "—", hint: "按每晚当时的目标" },
+      { label: "平均记录时段", value: summary.count ? formatDuration(summary.averageDuration) : "—", hint: "未扣除清醒时间" },
+      { label: "平均起床", value: wake == null ? "—" : `${String(Math.floor(wake / 60)).padStart(2, "0")}:${String(wake % 60).padStart(2, "0")}`, hint: "起床与睡醒分开记录" },
+      { label: "连续规则内", value: summary.count ? `${summary.consecutiveWithinRules} 晚` : "—", hint: "截至最新记录 · 缺日中断" },
     ];
-
-    els.statsGrid.innerHTML = cards
-      .map(
-        (card) => `
-          <article class="stat-card">
-            <span>${card.label}</span>
-            <strong>${card.value}</strong>
-            <small>${card.hint}</small>
-          </article>
-        `,
-      )
-      .join("");
+    els.statsGrid.innerHTML = cards.map((card) => `<article class="stat-card"><span>${card.label}</span><strong>${card.value}</strong><small>${card.hint}</small></article>`).join("");
+    els.periodSwitch.querySelectorAll("[data-summary-days]").forEach((button) => button.setAttribute("aria-pressed", String(Number(button.dataset.summaryDays) === trendUi.summaryDays)));
+    els.dataFreshness.textContent = summary.latestDate ? `最新记录 ${summary.latestDate} · 共 ${analysis.items.length} 晚` : "尚无记录";
+    const coverage = [];
+    if (summary.unrecordedSinceLatest) coverage.push(`此浏览器截至昨天还有 ${summary.unrecordedSinceLatest} 天未见记录，请先刷新核对`);
+    if (summary.missingDatesInWindow.length) coverage.push(`摘要期间缺 ${summary.missingDatesInWindow.length} 天：${summary.missingDatesInWindow.map(shortDate).join("、")}`);
+    coverage.push(summary.todayRecorded ? "今天已记录" : "今天待记录");
+    els.recordCoverage.textContent = coverage.join(" · ");
+    els.recordTodayLink.innerHTML = `${summary.todayRecorded ? "查看今天" : "记录今天"} <i data-lucide="arrow-up-right"></i>`;
+    window.lucide && window.lucide.createIcons();
   }
 
   function renderChart(analysis = analyzeEntries()) {
@@ -371,9 +450,8 @@
     const anomalies = items.filter((item) => item.targetReasons.length);
     const range = trendCore.getChartRange(items, state.settings);
 
-    if (trendUi.selectedDate === null || (trendUi.selectedDate && !itemByDate.has(trendUi.selectedDate))) {
-      trendUi.selectedDate = (anomalies.at(-1) || items.at(-1) || {}).date || "";
-    }
+    if (trendUi.selectedDate && !itemByDate.has(trendUi.selectedDate)) trendUi.selectedDate = "";
+    if (!months.some((month) => month.key === trendUi.activeMonth)) trendUi.activeMonth = months[0]?.key || "";
 
     return {
       items,
@@ -388,25 +466,18 @@
   }
 
   function renderTrendHeader(model) {
+    els.historyToggle.hidden = model.months.length < 2;
+    els.historyToggle.setAttribute("aria-expanded", String(trendUi.showHistory));
+    els.historyToggle.textContent = trendUi.showHistory ? "收起历史月份" : "展开全部月份";
     if (!model.items.length) {
       els.rangeLabel.textContent = "";
-      els.trendTitle.textContent = "从今晚开始记录节律";
       els.trendDescription.textContent = "还没有睡眠记录。";
       return;
     }
-
     const first = model.items[0];
     const latest = model.items.at(-1);
-    const stableDays = countStableDays(model.items);
-    const anomalyCount = model.anomalies.length;
-    els.rangeLabel.textContent = `${first.date} → ${latest.date} · 共 ${model.items.length} 晚`;
-    els.trendTitle.textContent =
-      stableDays >= 7
-        ? `过去 ${stableDays} 天节律稳定，少数夜晚形成明显断点。`
-        : anomalyCount
-          ? `节律仍在恢复，${anomalyCount} 个夜晚形成明显断点。`
-          : "节律保持稳定，继续观察长期变化。";
-    els.trendDescription.textContent = `全部日期从 ${first.date} 到 ${latest.date}，共 ${model.items.length} 晚，${anomalyCount} 晚偏离当日目标。蓝线表示入睡，红线表示起床，橙色外环表示偏离；目标背景按生效日期分段。`;
+    els.rangeLabel.textContent = `${first.date} → ${latest.date} · ${model.items.length} 晚`;
+    els.trendDescription.textContent = `全部历史共 ${model.items.length} 晚。蓝线表示就寝，红线表示起床，橙色外环表示触发时间规则；背景为目标至延后阈值。点击月份查看，点击日期读备注。`;
   }
 
   function renderOverviewChart(model) {
@@ -466,7 +537,7 @@
   }
 
   function renderMonthJump(model) {
-    const selectedMonth = trendUi.selectedDate ? trendUi.selectedDate.slice(0, 7) : "";
+    const selectedMonth = trendUi.activeMonth;
     const spansYears = new Set(model.months.map((month) => month.year)).size > 1;
     els.monthJump.innerHTML = model.months
       .map(
@@ -475,7 +546,7 @@
             class="month-jump-button${month.key === selectedMonth ? " is-current" : ""}"
             type="button"
             data-month-target="${month.key}"
-            aria-label="跳转到 ${month.label}"
+            aria-label="查看 ${month.label}"
             ${month.key === selectedMonth ? 'aria-current="true"' : ""}
           >${spansYears ? `${String(month.year).slice(-2)}年` : ""}${month.month}月</button>
         `,
@@ -484,7 +555,8 @@
   }
 
   function renderMonthCharts(model) {
-    els.monthCharts.innerHTML = model.months.map((month) => renderMonthSection(month, model)).join("");
+    const months = trendUi.showHistory ? model.months : model.months.filter((month) => month.key === trendUi.activeMonth);
+    els.monthCharts.innerHTML = months.map((month) => renderMonthSection(month, model)).join("");
   }
 
   function renderMonthSection(month, model) {
@@ -505,7 +577,7 @@
           preserveAspectRatio="xMidYMid meet"
           role="group"
           aria-label="${month.label}睡眠趋势，共 ${month.recordCount} 晚"
-        ><title>${month.label}睡眠趋势</title><desc>蓝线表示入睡，红线表示起床，橙色外环表示偏离。可用方向键浏览记录。</desc>${renderMonthSvg(month, model, frame)}</svg>
+        ><title>${month.label}睡眠趋势</title><desc>蓝线表示就寝，红线表示起床，橙色外环表示偏离。可用方向键浏览记录。</desc>${renderMonthSvg(month, model, frame)}</svg>
       </section>
     `;
   }
@@ -623,7 +695,7 @@
     const step = days.length > 1 ? Math.abs(x(1) - x(0)) : width;
     const band = (targetValue, threshold, className, segmentLeft, segmentWidth) => {
       const target = trendCore.normalizeNightTime(targetValue, className === "bed" ? "bed" : "wake");
-      const start = clamp(target - threshold, range.min, range.max);
+      const start = clamp(target, range.min, range.max);
       const end = clamp(target + threshold, range.min, range.max);
       return `<rect class="target-band ${className}" x="${segmentLeft.toFixed(2)}" y="${y(start).toFixed(2)}" width="${segmentWidth.toFixed(2)}" height="${Math.max(2, y(end) - y(start)).toFixed(2)}"></rect>`;
     };
@@ -653,15 +725,8 @@
   function renderDayDetail(model) {
     const item = model.selectedItem;
     if (!item) {
-      els.dayDetail.hidden = false;
-      els.dayDetail.classList.add("is-empty");
-      els.dayDetail.innerHTML = `
-        <div>
-          <p class="detail-eyebrow">日期详情</p>
-          <h3>选择任意日期</h3>
-          <p>点击月度趋势中的一晚，查看准确时间、影响因素与备注。</p>
-        </div>
-      `;
+      els.dayDetail.hidden = true;
+      els.dayDetail.innerHTML = "";
       return;
     }
 
@@ -670,7 +735,7 @@
     const next = model.items[index + 1];
     const reasons = item.targetReasons.length
       ? item.targetReasons.map((reason) => `<span class="reason-pill">${escapeHtml(reason)}</span>`).join("")
-      : '<span class="reason-pill stable">目标范围内</span>';
+      : '<span class="reason-pill stable">未触发时间规则</span>';
     const tagsMarkup = item.tags.length
       ? `<div class="detail-tags">${item.tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>`
       : "";
@@ -688,9 +753,9 @@
         </button>
       </header>
       <div class="night-detail-stats">
-        <div><span>入睡</span><strong class="sleep-text">${item.bedTime}</strong></div>
+        <div><span>${entryDetails.bedtimeLabel(item)}</span><strong class="sleep-text">${item.bedTime}</strong></div>
         <div><span>起床</span><strong class="wake-text">${item.wakeTime}</strong></div>
-        <div><span>睡眠时长</span><strong>${formatDurationLong(item.duration)}</strong></div>
+        <div><span>记录时段</span><strong>${formatDurationLong(item.duration)}</strong></div>
       </div>
       <div class="detail-section">
         <span class="detail-label">状态</span>
@@ -698,8 +763,9 @@
       </div>
       <div class="detail-section">
         <span class="detail-label">当日目标</span>
-        <p class="detail-note">入睡 ${item.appliedTarget.targetBed} · 起床 ${item.appliedTarget.targetWake} · 允许偏差 ${item.appliedTarget.driftThreshold} 分钟</p>
+        <p class="detail-note">就寝 ${item.appliedTarget.targetBed} · 起床 ${item.appliedTarget.targetWake} · 晚于目标超过 ${item.appliedTarget.driftThreshold} 分钟时标记</p>
       </div>
+      ${renderOptionalDetails(item)}
       ${tagsMarkup}
       ${item.note ? `<div class="detail-section"><span class="detail-label">备注</span><p class="detail-note">${escapeHtml(item.note)}</p></div>` : ""}
       <button class="detail-edit" type="button" data-detail-action="edit">
@@ -720,6 +786,15 @@
     `;
   }
 
+  function renderOptionalDetails(item) {
+    const values = [];
+    if (item.sleepOnsetTime) values.push(`估计睡着 ${item.sleepOnsetTime}`);
+    if (item.finalWakeTime) values.push(`最终醒来 ${item.finalWakeTime}`);
+    if (item.awakeMinutes != null) values.push(`夜间清醒 ${item.awakeMinutes} 分钟`);
+    if (item.morningFeeling) values.push(`晨起感受：${entryDetails.feelings[item.morningFeeling]}`);
+    return values.length ? `<div class="detail-section"><span class="detail-label">补充记录</span><p class="detail-note">${values.map(escapeHtml).join(" · ")}</p></div>` : "";
+  }
+
   function handleTrendClick(event) {
     const day = event.target.closest("[data-date]");
     if (day) {
@@ -731,6 +806,7 @@
   }
 
   function handleTrendKeydown(event) {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
     const day = event.target.closest("[data-date]");
     const monthHit = event.target.closest(".month-hit");
     if (day && (event.key === "Enter" || event.key === " ")) {
@@ -785,6 +861,7 @@
 
   function selectTrendDate(date, options = {}) {
     trendUi.selectedDate = date;
+    trendUi.activeMonth = date.slice(0, 7);
     renderChart();
     if (options.focus) {
       requestAnimationFrame(() => {
@@ -836,7 +913,10 @@
   function handleMonthJump(event) {
     const button = event.target.closest("[data-month-target]");
     if (!button) return;
-    const target = document.querySelector(`#month-${button.dataset.monthTarget}`);
+    trendUi.activeMonth = button.dataset.monthTarget;
+    if (trendUi.selectedDate && !trendUi.selectedDate.startsWith(trendUi.activeMonth)) trendUi.selectedDate = "";
+    renderChart();
+    const target = document.querySelector(`#month-${trendUi.activeMonth}`);
     target && target.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
   }
 
@@ -847,13 +927,14 @@
   }
 
   function trendDayAriaLabel(item) {
-    const stateLabel = item.targetReasons.length ? `，偏离：${item.targetReasons.join("、")}` : "，目标范围内";
-    return `${formatDate(item.date)}，入睡 ${item.bedTime}，起床 ${item.wakeTime}，睡眠 ${formatDurationLong(item.duration)}${stateLabel}`;
+    const stateLabel = item.targetReasons.length ? `，偏离：${item.targetReasons.join("、")}` : "，未触发时间规则";
+    return `${formatDate(item.date)}，${entryDetails.bedtimeLabel(item)} ${item.bedTime}，起床 ${item.wakeTime}，记录时段 ${formatDurationLong(item.duration)}${stateLabel}`;
   }
 
   function formatDurationLong(minutes) {
-    const hours = Math.floor(minutes / 60);
-    const mins = Math.round(minutes % 60);
+    const rounded = Math.round(minutes);
+    const hours = Math.floor(rounded / 60);
+    const mins = rounded % 60;
     return mins ? `${hours}小时${mins}分钟` : `${hours}小时`;
   }
 
@@ -862,9 +943,12 @@
   }
 
   function renderAnomalies(analysis) {
-    const anomalies = analysis.items.filter((item) => item.targetReasons.length).reverse();
+    const summary = recentSummary(analysis);
+    const anomalies = analysis.items.filter((item) => item.targetReasons.length && item.date >= summary.startDate && item.date <= summary.endDate).reverse();
     if (!anomalies.length) {
-      els.anomalyList.innerHTML = '<p class="muted">暂无明显偏离。</p>';
+      els.anomalyList.innerHTML = summary.count
+        ? '<p class="muted">所选摘要期间，已记录的夜晚均未触发时间规则。时间规则不代表睡眠质量。</p>'
+        : '<p class="muted">记录后会在这里展示近期触发时间规则的夜晚。</p>';
       return;
     }
 
@@ -873,15 +957,21 @@
         (item) => `
           <article class="anomaly-item">
             <p class="item-title">${formatDate(item.date)}</p>
-            <p class="item-meta">入睡 ${item.bedTime} · 起床 ${item.wakeTime} · ${formatDuration(item.duration)}</p>
+            <p class="item-meta">${entryDetails.bedtimeLabel(item)} ${item.bedTime} · 起床 ${item.wakeTime} · 记录 ${formatDuration(item.duration)}</p>
             <div class="reason-list">
               ${item.targetReasons.map((reason) => `<span class="reason-pill">${escapeHtml(reason)}</span>`).join("")}
             </div>
-            ${item.note ? `<p class="note-text">${escapeHtml(item.note)}</p>` : ""}
+            ${renderEntryNote(item.note)}
           </article>
         `,
       )
       .join("");
+  }
+
+  function renderEntryNote(note) {
+    if (!note) return "";
+    if (note.length <= 80) return `<p class="note-text">${escapeHtml(note)}</p>`;
+    return `<details class="entry-note"><summary>${escapeHtml(note.slice(0, 72))}… <span>展开</span></summary><p class="note-text">${escapeHtml(note)}</p></details>`;
   }
 
   function renderEntries(analysis) {
@@ -890,7 +980,13 @@
       return;
     }
 
-    els.entryList.innerHTML = analysis.items
+    const query = els.entrySearch.value.trim().toLocaleLowerCase();
+    const results = analysis.items.filter((item) => !query || [item.date, shortDate(item.date), item.note, ...item.tags].join(" ").toLocaleLowerCase().includes(query));
+    if (!results.length) {
+      els.entryList.innerHTML = '<p class="muted">没有匹配的记录，请换个日期、备注关键词或标签。</p>';
+      return;
+    }
+    els.entryList.innerHTML = results
       .slice()
       .reverse()
       .map(
@@ -899,7 +995,7 @@
             <div class="item-row">
               <div>
                 <p class="item-title">${formatDate(item.date)}</p>
-                <p class="item-meta">入睡 ${item.bedTime} · 起床 ${item.wakeTime} · ${formatDuration(item.duration)}</p>
+                <p class="item-meta">${entryDetails.bedtimeLabel(item)} ${item.bedTime} · 起床 ${item.wakeTime} · 记录 ${formatDuration(item.duration)}</p>
               </div>
               <div class="entry-actions">
                 <button class="mini-button" type="button" data-action="edit" data-id="${item.id}" title="编辑" aria-label="编辑">
@@ -911,7 +1007,7 @@
               </div>
             </div>
             ${item.tags.length ? `<div class="reason-list">${item.tags.map((tag) => `<span class="reason-pill">${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
-            ${item.note ? `<p class="note-text">${escapeHtml(item.note)}</p>` : ""}
+            ${renderEntryNote(item.note)}
           </article>
         `,
       )
@@ -929,15 +1025,20 @@
   }
 
   function editEntry(entry) {
+    if (formDraftState.entryDirty && !confirm("当前记录有未保存的修改。放弃修改并打开所选记录？")) return false;
     els.editingId.value = entry.id;
     els.sleepDate.value = entry.date;
     els.bedTime.value = entry.bedTime;
     els.wakeTime.value = entry.wakeTime;
     els.note.value = entry.note || "";
+    hydrateEntryDetails(entry);
     renderTags(entry.tags || []);
+    formDraftState.entryDirty = false;
     els.form.querySelector(".primary-button").innerHTML = '<i data-lucide="save"></i>更新记录';
     window.lucide && window.lucide.createIcons();
-    els.form.scrollIntoView({ behavior: "smooth", block: "start" });
+    window.location.hash = "entryForm";
+    els.form.scrollIntoView({ behavior: prefersReducedMotion() ? "auto" : "smooth", block: "start" });
+    return true;
   }
 
   function deleteEntry(id) {
@@ -956,7 +1057,7 @@
     state.entries = [];
     persistEntries();
     queueCloudDeletes(deletedIds);
-    resetEntryForm();
+    resetEntryForm({ force: true });
     render();
   }
 
@@ -1162,7 +1263,8 @@
         const batch = writeBatch(syncState.db);
         writes.slice(offset, offset + batchSize).forEach((operation) => {
           if (operation.type === "upsert") {
-            batch.set(doc(entriesRef, operation.entry.id), operation.entry, { merge: true });
+            // Entry operations contain complete snapshots; replacement also clears omitted optional fields.
+            batch.set(doc(entriesRef, operation.entry.id), operation.entry);
           }
           if (operation.type === "delete") {
             batch.delete(doc(entriesRef, operation.id));
@@ -1246,6 +1348,9 @@
 
   function updateTrendSourceStatus(status = "local") {
     if (!els.trendSourceStatus) return;
+    els.checkSyncBtn.hidden = !syncState.ready;
+    els.checkSyncBtn.disabled = status === "checking";
+    els.checkSyncBtn.textContent = status === "checking" ? "核对中…" : "刷新核对";
     const pendingCount = pendingCloudOperationCount();
     const syncedAt = syncState.lastSyncAt
       ? new Date(syncState.lastSyncAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
@@ -1320,35 +1425,12 @@
   function formatTargetReason(reason) {
     if (reason.type === "late-bed") return `晚睡 ${formatDelta(reason.minutes)}`;
     if (reason.type === "late-wake") return `晚起 ${formatDelta(reason.minutes)}`;
-    if (reason.type === "short-sleep") return "睡眠不足 6 小时";
+    if (reason.type === "short-sleep") return "记录时段不足 6 小时";
     return "偏离目标";
   }
 
-  function countStableDays(items) {
-    let count = 0;
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      if (!items[index].stable) break;
-      count += 1;
-    }
-    return count;
-  }
-
-  function recoveryLabel(items) {
-    let lastAnomalyIndex = -1;
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      if (items[index].targetReasons.length) {
-        lastAnomalyIndex = index;
-        break;
-      }
-    }
-    if (lastAnomalyIndex === -1) return "一直稳定";
-    const daysAfter = items.length - lastAnomalyIndex - 1;
-    if (daysAfter <= 0) return "恢复中";
-    return `${daysAfter} 天`;
-  }
-
   function exportCsv() {
-    const header = ["日期", "入睡时间", "起床时间", "睡眠时长", "当日目标入睡", "当日目标起床", "偏离阈值", "影响因素", "备注"];
+    const header = ["日期", "就寝时间", "起床时间", "记录时段", "当日目标就寝", "当日目标起床", "延后阈值", "影响因素", "备注", "就寝含义", "估计睡着", "最终醒来", "夜间清醒分钟", "晨起感受"];
     const rows = analyzeEntries().items.map((item) => [
       item.date,
       item.bedTime,
@@ -1359,6 +1441,11 @@
       item.appliedTarget.driftThreshold,
       item.tags.join("；"),
       item.note || "",
+      entryDetails.bedtimeLabel(item),
+      item.sleepOnsetTime || "",
+      item.finalWakeTime || "",
+      item.awakeMinutes ?? "",
+      entryDetails.feelings[item.morningFeeling] || "",
     ]);
     const csv = [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\n");
     download(`sleep-rhythm-${todayString()}.csv`, `\uFEFF${csv}`, "text/csv;charset=utf-8");
@@ -1366,7 +1453,7 @@
 
   function exportJson() {
     const payload = {
-      version: 2,
+      version: 3,
       exportedAt: new Date().toISOString(),
       settings: state.settings,
       entries: state.entries,
@@ -1705,6 +1792,7 @@
       date: entry.date,
       bedTime: entry.bedTime,
       wakeTime: entry.wakeTime,
+      ...entryDetails.normalize(entry),
       tags: Array.isArray(entry.tags) ? entry.tags.filter((tag) => tags.includes(tag)) : [],
       note: entry.note || "",
       updatedAt: entry.updatedAt || new Date().toISOString(),
@@ -1765,15 +1853,17 @@
   }
 
   function formatDuration(minutes) {
-    const hours = Math.floor(minutes / 60);
-    const mins = Math.round(minutes % 60);
+    const rounded = Math.round(minutes);
+    const hours = Math.floor(rounded / 60);
+    const mins = rounded % 60;
     return `${hours}h${String(mins).padStart(2, "0")}`;
   }
 
   function formatDelta(minutes) {
     if (minutes < 60) return `${Math.round(minutes)} 分钟`;
-    const hours = Math.floor(minutes / 60);
-    const mins = Math.round(minutes % 60);
+    const rounded = Math.round(minutes);
+    const hours = Math.floor(rounded / 60);
+    const mins = rounded % 60;
     return mins ? `${hours} 小时 ${mins} 分钟` : `${hours} 小时`;
   }
 
